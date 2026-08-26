@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Datasets
+*.tif
+*.tiff
+*.7z
+*.zip
+*.tar
+*.gz
+
+data/
+datasets/
+
+# ML artifacts
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.onnx
+
+# Experiment outputs
+logs/
+runs/
+mlruns/
+outputs/
+
+# Local environment
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
