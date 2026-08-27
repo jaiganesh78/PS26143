@@ -1,17 +1,33 @@
+# =========================
 # Python
+# =========================
+
 __pycache__/
 *.py[cod]
 *.pyo
+*.so
 
+
+# =========================
 # Virtual environments
+# =========================
+
 .venv/
 venv/
 env/
 
+
+# =========================
 # Jupyter
+# =========================
+
 .ipynb_checkpoints/
 
-# Datasets
+
+# =========================
+# Dataset files
+# =========================
+
 *.tif
 *.tiff
 *.7z
@@ -19,29 +35,55 @@ env/
 *.tar
 *.gz
 
-data/
-datasets/
+# Local dataset warehouse
+D:/PS26143_DATA/
 
+# ML repository data directories
+ml/data/raw/
+ml/data/processed/
+
+
+# =========================
 # ML artifacts
-checkpoints/
+# =========================
+
+ml/checkpoints/
+ml/logs/
+
 *.pth
 *.pt
 *.ckpt
 *.onnx
 
+
+# =========================
 # Experiment outputs
+# =========================
+
 logs/
 runs/
 mlruns/
 outputs/
 
+
+# =========================
 # Local environment
+# =========================
+
 .env
 
+
+# =========================
 # OS
+# =========================
+
 .DS_Store
 Thumbs.db
 
+
+# =========================
 # IDE
+# =========================
+
 .vscode/
 .idea/
