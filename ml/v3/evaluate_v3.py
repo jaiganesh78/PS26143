@@ -9,26 +9,25 @@ import cv2
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 
-# ------------------------------------------------------------
-# Make ml/src importable regardless of launch directory
-# ------------------------------------------------------------
+
+# ============================================================
+# PATH SETUP
+# ============================================================
 
 HERE = Path(__file__).resolve()
+
 ML_ROOT = HERE.parent.parent
+REPO_ROOT = ML_ROOT.parent
 SRC_ROOT = ML_ROOT / "src"
 
-if str(ML_ROOT) not in sys.path:
-    sys.path.insert(0, str(ML_ROOT))
+for path in [REPO_ROOT, ML_ROOT, SRC_ROOT]:
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
 
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
 
-from datasets.oil_dataset import OilSegmentationDataset
 from models.segmentation_model import build_model
-
-from candidate_dataset import CandidateDataset
 from candidate_model import CandidateClassifier
 
 
@@ -38,30 +37,150 @@ from candidate_model import CandidateClassifier
 
 IMAGE_SIZE = 512
 V1_THRESHOLD = 0.50
-DEFAULT_V3_THRESHOLD = 0.50
 
 
 # ============================================================
-# CHECKPOINT LOADING
+# SIMPLE MANIFEST DATASET
 # ============================================================
 
-def load_checkpoint(model, path, device):
+class TestManifestDataset(Dataset):
+
+    def __init__(self, manifest_path):
+
+        self.df = pd.read_csv(
+            manifest_path
+        )
+
+        required = {
+            "global_id",
+            "dataset",
+            "image",
+            "mask",
+        }
+
+        missing = (
+            required
+            - set(self.df.columns)
+        )
+
+        if missing:
+            raise RuntimeError(
+                "Test manifest is missing "
+                f"columns: {sorted(missing)}"
+            )
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+
+        row = self.df.iloc[idx]
+
+        image_path = Path(
+            row["image"]
+        )
+
+        mask_path = Path(
+            row["mask"]
+        )
+
+        if not image_path.exists():
+            raise FileNotFoundError(
+                image_path
+            )
+
+        if not mask_path.exists():
+            raise FileNotFoundError(
+                mask_path
+            )
+
+        image = np.load(
+            image_path
+        ).astype(np.float32)
+
+        mask = np.load(
+            mask_path
+        ).astype(np.float32)
+
+        if image.shape != (
+            2,
+            IMAGE_SIZE,
+            IMAGE_SIZE,
+        ):
+            raise ValueError(
+                f"Unexpected image shape "
+                f"{image.shape} for "
+                f"{row['global_id']}"
+            )
+
+        if mask.shape != (
+            IMAGE_SIZE,
+            IMAGE_SIZE,
+        ):
+            raise ValueError(
+                f"Unexpected mask shape "
+                f"{mask.shape} for "
+                f"{row['global_id']}"
+            )
+
+        return {
+            "image": torch.from_numpy(
+                image
+            ),
+            "mask": torch.from_numpy(
+                mask
+            ),
+            "global_id": str(
+                row["global_id"]
+            ),
+            "dataset": str(
+                row["dataset"]
+            ),
+        }
+
+
+# ============================================================
+# CHECKPOINT LOADER
+# ============================================================
+
+def load_checkpoint(
+    model,
+    checkpoint_path,
+    device,
+):
 
     checkpoint = torch.load(
-        path,
+        checkpoint_path,
         map_location=device,
         weights_only=False,
     )
 
-    if "model_state_dict" in checkpoint:
-        state = checkpoint["model_state_dict"]
-    elif "state_dict" in checkpoint:
-        state = checkpoint["state_dict"]
+    if (
+        isinstance(checkpoint, dict)
+        and "model_state_dict"
+        in checkpoint
+    ):
+
+        state_dict = checkpoint[
+            "model_state_dict"
+        ]
+
+    elif (
+        isinstance(checkpoint, dict)
+        and "state_dict"
+        in checkpoint
+    ):
+
+        state_dict = checkpoint[
+            "state_dict"
+        ]
+
     else:
-        state = checkpoint
+
+        state_dict = checkpoint
 
     model.load_state_dict(
-        state,
+        state_dict,
         strict=True,
     )
 
@@ -69,7 +188,7 @@ def load_checkpoint(model, path, device):
 
 
 # ============================================================
-# V1 MODEL
+# BUILD V1
 # ============================================================
 
 def build_v1(device):
@@ -82,11 +201,15 @@ def build_v1(device):
         classes=1,
     )
 
-    return model.to(device)
+    model = model.to(device)
+
+    model.eval()
+
+    return model
 
 
 # ============================================================
-# V3 MODEL
+# BUILD V3
 # ============================================================
 
 def build_v3(device):
@@ -96,64 +219,68 @@ def build_v3(device):
         pretrained=False,
     )
 
-    return model.to(device)
+    model = model.to(device)
+
+    model.eval()
+
+    return model
 
 
 # ============================================================
-# FEATURE CONSTRUCTION
+# V1 PREDICTION
 # ============================================================
 
-def build_features(
-    area,
-    width,
-    height,
-    centroid_x,
-    centroid_y,
-    mean_probability,
-    p95_probability,
-    max_probability,
+def predict_v1(
+    model,
+    image,
+    device,
 ):
 
-    width = max(float(width), 1.0)
-    height = max(float(height), 1.0)
-
-    aspect_ratio = width / height
-
-    normalized_area = (
-        float(area)
-        / float(IMAGE_SIZE * IMAGE_SIZE)
-    )
-
-    log_area = (
-        np.log1p(float(area))
-        / np.log1p(
-            float(IMAGE_SIZE * IMAGE_SIZE)
+    tensor = (
+        torch.from_numpy(
+            image
         )
+        .unsqueeze(0)
+        .to(device)
     )
 
-    return np.array(
-        [
-            normalized_area,
-            log_area,
-            aspect_ratio / 10.0,
-            float(centroid_x) / IMAGE_SIZE,
-            float(centroid_y) / IMAGE_SIZE,
-            float(mean_probability),
-            float(p95_probability),
-            float(max_probability),
-        ],
-        dtype=np.float32,
+    with torch.inference_mode():
+
+        with torch.autocast(
+            device_type="cuda",
+            dtype=torch.float16,
+            enabled=(
+                device.type == "cuda"
+            ),
+        ):
+
+            logits = model(
+                tensor
+            )
+
+            probability = torch.sigmoid(
+                logits
+            )
+
+    return (
+        probability[
+            0,
+            0,
+        ]
+        .float()
+        .cpu()
+        .numpy()
     )
 
 
 # ============================================================
-# COMPONENT EXTRACTION
+# CANDIDATE EXTRACTION
 # ============================================================
 
 def extract_candidates(
     image,
     probability,
-    threshold=V1_THRESHOLD,
+    threshold=0.50,
     min_area=20,
     crop_size=128,
     padding=16,
@@ -203,14 +330,14 @@ def extract_candidates(
             ]
         )
 
-        w = int(
+        width = int(
             stats[
                 component_id,
                 cv2.CC_STAT_WIDTH,
             ]
         )
 
-        h = int(
+        height = int(
             stats[
                 component_id,
                 cv2.CC_STAT_HEIGHT,
@@ -221,32 +348,17 @@ def extract_candidates(
             component_id
         ]
 
-        x0 = max(
-            0,
-            x - padding,
+        center_x = int(
+            round(cx)
         )
 
-        y0 = max(
-            0,
-            y - padding,
+        center_y = int(
+            round(cy)
         )
-
-        x1 = min(
-            IMAGE_SIZE,
-            x + w + padding,
-        )
-
-        y1 = min(
-            IMAGE_SIZE,
-            y + h + padding,
-        )
-
-        # Centered crop with fixed 128×128 output.
-        center_x = int(round(cx))
-        center_y = int(round(cy))
 
         sx0 = center_x - half
         sy0 = center_y - half
+
         sx1 = sx0 + crop_size
         sy1 = sy0 + crop_size
 
@@ -296,7 +408,7 @@ def extract_candidates(
             sx0:sx1,
         ]
 
-        component_mask = (
+        crop_mask = (
             labels[
                 sy0:sy1,
                 sx0:sx1,
@@ -304,12 +416,12 @@ def extract_candidates(
             == component_id
         ).astype(np.float32)
 
-        if (
-            pad_left
-            or pad_top
-            or pad_right
-            or pad_bottom
-        ):
+        if any([
+            pad_left,
+            pad_top,
+            pad_right,
+            pad_bottom,
+        ]):
 
             crop_image = np.pad(
                 crop_image,
@@ -330,8 +442,8 @@ def extract_candidates(
                 mode="constant",
             )
 
-            component_mask = np.pad(
-                component_mask,
+            crop_mask = np.pad(
+                crop_mask,
                 (
                     (
                         pad_top,
@@ -351,112 +463,166 @@ def extract_candidates(
             :crop_size,
         ]
 
-        component_mask = component_mask[
+        crop_mask = crop_mask[
             :crop_size,
             :crop_size,
         ]
 
-        # Safety resize if boundary arithmetic produced
-        # anything other than exactly 128×128.
         if (
-            crop_image.shape[1] != crop_size
-            or crop_image.shape[2] != crop_size
+            crop_image.shape[1]
+            != crop_size
+            or crop_image.shape[2]
+            != crop_size
         ):
 
-            resized = []
+            channels = []
 
             for channel in crop_image:
 
-                resized.append(
+                channels.append(
                     cv2.resize(
                         channel,
                         (
                             crop_size,
                             crop_size,
                         ),
-                        interpolation=cv2.INTER_LINEAR,
+                        interpolation=(
+                            cv2.INTER_LINEAR
+                        ),
                     )
                 )
 
             crop_image = np.stack(
-                resized,
+                channels,
                 axis=0,
             )
 
         if (
-            component_mask.shape[0] != crop_size
-            or component_mask.shape[1] != crop_size
+            crop_mask.shape[0]
+            != crop_size
+            or crop_mask.shape[1]
+            != crop_size
         ):
 
-            component_mask = cv2.resize(
-                component_mask,
+            crop_mask = cv2.resize(
+                crop_mask,
                 (
                     crop_size,
                     crop_size,
                 ),
-                interpolation=cv2.INTER_NEAREST,
+                interpolation=(
+                    cv2.INTER_NEAREST
+                ),
             )
 
-        component_probability = (
+        component_pixels = (
+            labels
+            == component_id
+        )
+
+        component_probs = (
             probability[
-                sy0:sy1,
-                sx0:sx1,
+                component_pixels
             ]
         )
 
-        if component_probability.size == 0:
+        if component_probs.size == 0:
             continue
 
         mean_probability = float(
-            component_probability[
-                component_mask > 0.5
-            ].mean()
+            component_probs.mean()
         )
 
         p95_probability = float(
             np.percentile(
-                component_probability[
-                    component_mask > 0.5
-                ],
+                component_probs,
                 95,
             )
         )
 
         max_probability = float(
-            component_probability.max()
+            component_probs.max()
         )
 
-        features = build_features(
-            area=area,
-            width=w,
-            height=h,
-            centroid_x=cx,
-            centroid_y=cy,
-            mean_probability=mean_probability,
-            p95_probability=p95_probability,
-            max_probability=max_probability,
+        normalized_area = (
+            area
+            / float(
+                IMAGE_SIZE
+                * IMAGE_SIZE
+            )
+        )
+
+        log_area = (
+            np.log1p(area)
+            / np.log1p(
+                IMAGE_SIZE
+                * IMAGE_SIZE
+            )
+        )
+
+        aspect_ratio = (
+            width
+            / max(
+                height,
+                1,
+            )
+        )
+
+        features = np.array(
+            [
+                normalized_area,
+                log_area,
+                aspect_ratio / 10.0,
+                cx / IMAGE_SIZE,
+                cy / IMAGE_SIZE,
+                mean_probability,
+                p95_probability,
+                max_probability,
+            ],
+            dtype=np.float32,
         )
 
         candidates.append(
             {
-                "component_id": component_id,
-                "area": area,
-                "x": x,
-                "y": y,
-                "w": w,
-                "h": h,
-                "centroid_x": float(cx),
-                "centroid_y": float(cy),
-                "crop_image": crop_image.astype(
-                    np.float32
-                ),
-                "crop_mask": component_mask.astype(
-                    np.float32
-                ),
-                "features": features,
-                "mean_probability": mean_probability,
-                "p95_probability": p95_probability,
-                "max_probability": max_probability,
+                "component_id":
+                    component_id,
+
+                "area":
+                    area,
+
+                "width":
+                    width,
+
+                "height":
+                    height,
+
+                "centroid_x":
+                    float(cx),
+
+                "centroid_y":
+                    float(cy),
+
+                "crop_image":
+                    crop_image.astype(
+                        np.float32
+                    ),
+
+                "crop_mask":
+                    crop_mask.astype(
+                        np.float32
+                    ),
+
+                "features":
+                    features,
+
+                "mean_probability":
+                    mean_probability,
+
+                "p95_probability":
+                    p95_probability,
+
+                "max_probability":
+                    max_probability,
             }
         )
 
@@ -464,103 +630,10 @@ def extract_candidates(
 
 
 # ============================================================
-# NORMALIZATION
+# V3 PREDICTION
 # ============================================================
 
-def normalize_image(image):
-
-    image = image.astype(
-        np.float32
-    )
-
-    # Match the numerical representation expected by
-    # the already-trained SAR model without altering
-    # the candidate geometry.
-    for c in range(image.shape[0]):
-
-        channel = image[c]
-
-        lo = np.percentile(
-            channel,
-            1,
-        )
-
-        hi = np.percentile(
-            channel,
-            99,
-        )
-
-        if hi > lo:
-
-            channel = (
-                channel - lo
-            ) / (
-                hi - lo
-            )
-
-        else:
-
-            channel = np.zeros_like(
-                channel
-            )
-
-        image[c] = np.clip(
-            channel,
-            0.0,
-            1.0,
-        )
-
-    return image
-
-
-# ============================================================
-# V1 INFERENCE
-# ============================================================
-
-def predict_v1(
-    model,
-    image,
-    device,
-):
-
-    tensor = torch.from_numpy(
-        image
-    ).unsqueeze(0).to(
-        device,
-        non_blocking=True,
-    )
-
-    with torch.inference_mode():
-
-        with torch.autocast(
-            device_type="cuda",
-            dtype=torch.float16,
-            enabled=(
-                device.type == "cuda"
-            ),
-        ):
-
-            logits = model(
-                tensor
-            )
-
-            probability = torch.sigmoid(
-                logits
-            )[0, 0]
-
-    return (
-        probability
-        .float()
-        .cpu()
-        .numpy()
-    )
-
-
-# ============================================================
-# V3 CANDIDATE INFERENCE
-# ============================================================
-
-def predict_v3(
+def classify_candidates(
     model,
     candidates,
     device,
@@ -591,7 +664,9 @@ def predict_v3(
         images.append(x)
 
         features.append(
-            candidate["features"]
+            candidate[
+                "features"
+            ]
         )
 
     images = torch.from_numpy(
@@ -633,32 +708,33 @@ def predict_v3(
                 .numpy()
             )
 
-    accepted = []
+    results = []
 
     for candidate, probability in zip(
         candidates,
         probabilities,
     ):
 
-        candidate = dict(
+        item = dict(
             candidate
         )
 
-        candidate[
+        item[
             "v3_probability"
-        ] = float(probability)
+        ] = float(
+            probability
+        )
 
-        candidate[
+        item[
             "accepted"
         ] = bool(
-            probability >= threshold
+            probability
+            >= threshold
         )
 
-        accepted.append(
-            candidate
-        )
+        results.append(item)
 
-    return accepted
+    return results
 
 
 # ============================================================
@@ -670,12 +746,23 @@ def reconstruct_mask(
     candidates,
 ):
 
-    mask = np.zeros(
-        probability.shape,
+    base_binary = (
+        probability >= V1_THRESHOLD
+    ).astype(np.uint8)
+
+    num_labels, labels = (
+        cv2.connectedComponents(
+            base_binary,
+            connectivity=8,
+        )
+    )
+
+    output = np.zeros_like(
+        base_binary,
         dtype=np.uint8,
     )
 
-    accepted_count = 0
+    accepted = 0
 
     for candidate in candidates:
 
@@ -684,38 +771,27 @@ def reconstruct_mask(
         ]:
             continue
 
-        accepted_count += 1
-
         component_id = candidate[
             "component_id"
         ]
 
-        threshold_mask = (
-            probability >= V1_THRESHOLD
-        ).astype(np.uint8)
-
-        num_labels, labels = (
-            cv2.connectedComponents(
-                threshold_mask,
-                connectivity=8,
-            )
-        )
-
         if component_id >= num_labels:
             continue
 
-        mask[
+        output[
             labels == component_id
         ] = 1
 
-    return mask, accepted_count
+        accepted += 1
+
+    return output, accepted
 
 
 # ============================================================
-# METRICS
+# PIXEL METRICS
 # ============================================================
 
-def binary_metrics(
+def calculate_metrics(
     prediction,
     target,
 ):
@@ -808,28 +884,53 @@ def binary_metrics(
 
 
 # ============================================================
-# DATASET RECORD EXTRACTION
+# POLYGON EXPORT
 # ============================================================
 
-def get_record(dataset, idx):
+def save_polygons(
+    mask,
+    path,
+):
 
-    if hasattr(
-        dataset,
-        "records",
-    ):
-
-        return dataset.records[idx]
-
-    if hasattr(
-        dataset,
-        "df",
-    ):
-
-        return dataset.df.iloc[idx].to_dict()
-
-    raise RuntimeError(
-        "Cannot access dataset record."
+    contours, _ = cv2.findContours(
+        mask.astype(np.uint8),
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
     )
+
+    polygons = []
+
+    for contour in contours:
+
+        area = float(
+            cv2.contourArea(
+                contour
+            )
+        )
+
+        if area <= 0:
+            continue
+
+        polygons.append(
+            contour.reshape(
+                -1,
+                2,
+            ).tolist()
+        )
+
+    with open(
+        path,
+        "w",
+        encoding="utf-8",
+    ) as f:
+
+        json.dump(
+            {
+                "polygons": polygons
+            },
+            f,
+            indent=2,
+        )
 
 
 # ============================================================
@@ -867,7 +968,7 @@ def main():
     parser.add_argument(
         "--threshold",
         type=float,
-        default=DEFAULT_V3_THRESHOLD,
+        default=0.50,
     )
 
     args = parser.parse_args()
@@ -880,11 +981,14 @@ def main():
 
     print("=" * 70)
     print(
-        "PS26143 — V3 TEST INFERENCE"
+        "PS26143 — V3 FINAL TEST EVALUATION"
     )
     print("=" * 70)
 
-    print("Device:", device)
+    print(
+        "Device:",
+        device,
+    )
 
     if device.type == "cuda":
 
@@ -894,33 +998,22 @@ def main():
         )
 
     # --------------------------------------------------------
-    # Test dataset
+    # Test data
     # --------------------------------------------------------
 
-    test_dataset = (
-        OilSegmentationDataset(
-            manifest_path=str(
-                args.test_manifest
-            ),
-            image_size=IMAGE_SIZE,
-            augment=False,
+    dataset = (
+        TestManifestDataset(
+            args.test_manifest
         )
-    )
-
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=1,
-        shuffle=False,
-        num_workers=0,
     )
 
     print(
         "Test samples:",
-        len(test_dataset),
+        len(dataset),
     )
 
     # --------------------------------------------------------
-    # Models
+    # V1
     # --------------------------------------------------------
 
     print()
@@ -932,17 +1025,34 @@ def main():
         device
     )
 
-    load_checkpoint(
-        v1,
-        args.v1_checkpoint,
-        device,
+    checkpoint_v1 = (
+        load_checkpoint(
+            v1,
+            args.v1_checkpoint,
+            device,
+        )
     )
-
-    v1.eval()
 
     print(
-        "V1 loaded."
+        "V1 checkpoint loaded."
     )
+
+    if isinstance(
+        checkpoint_v1,
+        dict,
+    ):
+
+        print(
+            "V1 epoch:",
+            checkpoint_v1.get(
+                "epoch",
+                "unknown",
+            ),
+        )
+
+    # --------------------------------------------------------
+    # V3
+    # --------------------------------------------------------
 
     print()
     print(
@@ -953,20 +1063,33 @@ def main():
         device
     )
 
-    load_checkpoint(
-        v3,
-        args.v3_checkpoint,
-        device,
+    checkpoint_v3 = (
+        load_checkpoint(
+            v3,
+            args.v3_checkpoint,
+            device,
+        )
     )
-
-    v3.eval()
 
     print(
-        "V3 loaded."
+        "V3 checkpoint loaded."
     )
 
+    if isinstance(
+        checkpoint_v3,
+        dict,
+    ):
+
+        print(
+            "V3 epoch:",
+            checkpoint_v3.get(
+                "epoch",
+                "unknown",
+            ),
+        )
+
     # --------------------------------------------------------
-    # Output directories
+    # Output
     # --------------------------------------------------------
 
     args.output.mkdir(
@@ -994,67 +1117,56 @@ def main():
 
     rows = []
 
-    dataset_totals = {}
-
     # --------------------------------------------------------
-    # Inference
+    # Test inference
     # --------------------------------------------------------
 
     print()
+    print("=" * 70)
     print(
-        "=" * 70
+        "RUNNING V3 ON 135 UNTOUCHED TEST SCENES"
     )
-    print(
-        "RUNNING V3 ON UNTOUCHED TEST"
-    )
-    print(
-        "=" * 70
-    )
+    print("=" * 70)
 
     for idx in range(
-        len(test_dataset)
+        len(dataset)
     ):
 
-        sample = test_dataset[idx]
+        sample = dataset[idx]
 
-        # Dataset tensors are assumed C×H×W.
-        image = sample[
-            "image"
-        ]
-
-        target = sample[
-            "mask"
-        ]
-
-        if torch.is_tensor(image):
-            image = (
-                image.cpu()
-                .numpy()
-            )
-
-        if torch.is_tensor(target):
-            target = (
-                target.cpu()
-                .numpy()
-            )
-
-        image = image.astype(
-            np.float32
+        image = (
+            sample["image"]
+            .numpy()
+            .astype(np.float32)
         )
 
         target = (
-            target > 0.5
+            sample["mask"]
+            .numpy()
+            > 0.5
         ).astype(np.uint8)
 
-        if target.ndim == 3:
-            target = target.squeeze(0)
+        global_id = sample[
+            "global_id"
+        ]
 
-        # V1 dataset preprocessing has already been applied.
+        dataset_name = sample[
+            "dataset"
+        ]
+
+        # ----------------------------------------------------
+        # V1
+        # ----------------------------------------------------
+
         probability = predict_v1(
             v1,
             image,
             device,
         )
+
+        # ----------------------------------------------------
+        # V1 candidates
+        # ----------------------------------------------------
 
         candidates = extract_candidates(
             image,
@@ -1062,7 +1174,15 @@ def main():
             threshold=V1_THRESHOLD,
         )
 
-        candidates = predict_v3(
+        original_candidate_count = (
+            len(candidates)
+        )
+
+        # ----------------------------------------------------
+        # V3 rejection
+        # ----------------------------------------------------
+
+        candidates = classify_candidates(
             v3,
             candidates,
             device,
@@ -1076,35 +1196,33 @@ def main():
             )
         )
 
-        metrics = binary_metrics(
+        metrics = calculate_metrics(
             prediction,
             target,
         )
 
-        record = get_record(
-            test_dataset,
-            idx,
+        # ----------------------------------------------------
+        # Candidate statistics
+        # ----------------------------------------------------
+
+        rejected_count = (
+            original_candidate_count
+            - accepted_count
         )
 
-        global_id = str(
-            record.get(
-                "global_id",
-                record.get(
-                    "id",
-                    f"sample_{idx:04d}",
-                ),
-            )
-        )
+        v3_probabilities = [
+            x["v3_probability"]
+            for x in candidates
+        ]
 
-        dataset_name = str(
-            record.get(
-                "dataset",
-                "unknown",
-            )
+        max_v3_probability = (
+            max(v3_probabilities)
+            if v3_probabilities
+            else 0.0
         )
 
         # ----------------------------------------------------
-        # Save mask
+        # Save prediction mask
         # ----------------------------------------------------
 
         np.save(
@@ -1116,60 +1234,44 @@ def main():
         )
 
         # ----------------------------------------------------
-        # Polygon extraction
+        # Save polygons
         # ----------------------------------------------------
 
-        contours, _ = cv2.findContours(
-            prediction.astype(
-                np.uint8
-            ),
-            cv2.RETR_EXTERNAL,
-            cv2.CHAIN_APPROX_SIMPLE,
-        )
-
-        polygon_data = []
-
-        for contour in contours:
-
-            area = float(
-                cv2.contourArea(
-                    contour
-                )
-            )
-
-            if area <= 0:
-                continue
-
-            polygon_data.append(
-                contour.reshape(
-                    -1,
-                    2,
-                ).tolist()
-            )
-
-        with open(
+        save_polygons(
+            prediction,
             polygon_dir
             / f"{global_id}.json",
-            "w",
-            encoding="utf-8",
-        ) as f:
+        )
 
-            json.dump(
-                {
-                    "global_id": global_id,
-                    "polygons": polygon_data,
-                },
-                f,
-            )
+        # ----------------------------------------------------
+        # Row
+        # ----------------------------------------------------
 
         row = {
-            "global_id": global_id,
-            "dataset": dataset_name,
-            "v3_threshold": args.threshold,
-            "v1_candidate_count": len(
-                candidates
-            ),
-            "v3_accepted_candidates": accepted_count,
+            "global_id":
+                global_id,
+
+            "dataset":
+                dataset_name,
+
+            "v1_threshold":
+                V1_THRESHOLD,
+
+            "v3_threshold":
+                args.threshold,
+
+            "v1_candidates":
+                original_candidate_count,
+
+            "v3_accepted":
+                accepted_count,
+
+            "v3_rejected":
+                rejected_count,
+
+            "max_v3_probability":
+                max_v3_probability,
+
             **metrics,
         }
 
@@ -1177,16 +1279,16 @@ def main():
 
         print(
             f"{idx + 1:3d}/"
-            f"{len(test_dataset)} "
+            f"{len(dataset)} "
             f"{global_id:20s} "
-            f"dataset={dataset_name:10s} "
-            f"candidates={len(candidates):3d} "
+            f"{dataset_name:10s} "
+            f"cand={original_candidate_count:3d} "
             f"accepted={accepted_count:3d} "
             f"Dice={metrics['dice']:.4f}"
         )
 
     # --------------------------------------------------------
-    # Results
+    # DataFrame
     # --------------------------------------------------------
 
     results = pd.DataFrame(
@@ -1208,47 +1310,100 @@ def main():
         index=False,
     )
 
+    # --------------------------------------------------------
+    # Summary
+    # --------------------------------------------------------
+
     summary = {
-        "experiment": "oil-seg-v3",
-        "v1_checkpoint": str(
-            args.v1_checkpoint
-        ),
-        "v3_checkpoint": str(
-            args.v3_checkpoint
-        ),
-        "test_manifest": str(
-            args.test_manifest
-        ),
-        "test_samples": int(
-            len(results)
-        ),
-        "v1_threshold": V1_THRESHOLD,
-        "v3_threshold": args.threshold,
-        "device": str(device),
-        "gpu": (
-            torch.cuda.get_device_name(0)
-            if device.type == "cuda"
-            else None
-        ),
-        "overall": {
-            "dice": float(
-                results["dice"].mean()
+        "experiment":
+            "oil-seg-v3",
+
+        "v1_checkpoint":
+            str(args.v1_checkpoint),
+
+        "v3_checkpoint":
+            str(args.v3_checkpoint),
+
+        "test_manifest":
+            str(args.test_manifest),
+
+        "test_samples":
+            int(len(results)),
+
+        "v1_threshold":
+            V1_THRESHOLD,
+
+        "v3_threshold":
+            args.threshold,
+
+        "device":
+            str(device),
+
+        "gpu":
+            (
+                torch.cuda.get_device_name(0)
+                if device.type == "cuda"
+                else None
             ),
-            "iou": float(
-                results["iou"].mean()
-            ),
-            "precision": float(
-                results["precision"].mean()
-            ),
-            "recall": float(
-                results["recall"].mean()
-            ),
+
+        "overall_macro": {
+            "dice":
+                float(
+                    results["dice"].mean()
+                ),
+
+            "iou":
+                float(
+                    results["iou"].mean()
+                ),
+
+            "precision":
+                float(
+                    results[
+                        "precision"
+                    ].mean()
+                ),
+
+            "recall":
+                float(
+                    results[
+                        "recall"
+                    ].mean()
+                ),
         },
+
+        "overall_micro": {
+            "tp":
+                int(
+                    results["tp"].sum()
+                ),
+
+            "fp":
+                int(
+                    results["fp"].sum()
+                ),
+
+            "fn":
+                int(
+                    results["fn"].sum()
+                ),
+
+            "tn":
+                int(
+                    results["tn"].sum()
+                ),
+        },
+
         "by_dataset": {},
+
         "scene_level": {},
     }
 
-    for dataset_name in [
+    # --------------------------------------------------------
+    # Dataset metrics
+    # --------------------------------------------------------
+
+    for name in [
         "oil",
         "lookalike",
         "no_oil",
@@ -1256,53 +1411,63 @@ def main():
 
         subset = results[
             results["dataset"]
-            == dataset_name
+            == name
         ]
 
-        if len(subset) == 0:
+        if subset.empty:
             continue
 
         summary[
             "by_dataset"
-        ][dataset_name] = {
-            "samples": int(
-                len(subset)
-            ),
-            "dice": float(
-                subset["dice"].mean()
-            ),
-            "iou": float(
-                subset["iou"].mean()
-            ),
-            "precision": float(
-                subset[
-                    "precision"
-                ].mean()
-            ),
-            "recall": float(
-                subset[
-                    "recall"
-                ].mean()
-            ),
-            "false_positive_scenes": int(
-                (
-                    subset["fp"]
-                    > 0
-                ).sum()
-            ),
-            "false_positive_rate": float(
-                (
-                    subset["fp"]
-                    > 0
-                ).mean()
-            ),
-            "false_positive_pixels": int(
-                subset["fp"].sum()
-            ),
+        ][name] = {
+            "samples":
+                int(len(subset)),
+
+            "dice":
+                float(
+                    subset["dice"].mean()
+                ),
+
+            "iou":
+                float(
+                    subset["iou"].mean()
+                ),
+
+            "precision":
+                float(
+                    subset[
+                        "precision"
+                    ].mean()
+                ),
+
+            "recall":
+                float(
+                    subset[
+                        "recall"
+                    ].mean()
+                ),
+
+            "false_positive_scenes":
+                int(
+                    (
+                        subset["fp"]
+                        > 0
+                    ).sum()
+                ),
+
+            "false_positive_pixels":
+                int(
+                    subset["fp"].sum()
+                ),
         }
 
+    # --------------------------------------------------------
+    # Scene-level metrics
+    # --------------------------------------------------------
+
     oil = results[
-        results["dataset"] == "oil"
+        results["dataset"]
+        == "oil"
     ]
 
     lookalike = results[
@@ -1315,7 +1480,7 @@ def main():
         == "no_oil"
     ]
 
-    if len(oil):
+    if not oil.empty:
 
         summary[
             "scene_level"
@@ -1323,12 +1488,14 @@ def main():
             "oil_detection_rate"
         ] = float(
             (
-                oil["predicted_pixels"]
+                oil[
+                    "predicted_pixels"
+                ]
                 > 0
             ).mean()
         )
 
-    if len(lookalike):
+    if not lookalike.empty:
 
         summary[
             "scene_level"
@@ -1343,7 +1510,7 @@ def main():
             ).mean()
         )
 
-    if len(no_oil):
+    if not no_oil.empty:
 
         summary[
             "scene_level"
@@ -1373,7 +1540,7 @@ def main():
     print()
     print("=" * 70)
     print(
-        "✅ V3 TEST INFERENCE COMPLETE"
+        "✅ V3 TEST EVALUATION COMPLETE"
     )
     print("=" * 70)
 
