@@ -8,7 +8,7 @@ from PIL import Image
 
 
 # ============================================================
-# PS26143 — DATASET PREPROCESSING
+# PS26143 — FINAL PREPROCESSING PIPELINE
 # ============================================================
 
 DATA_ROOT = Path("/content/drive/MyDrive/PS26143")
@@ -16,31 +16,33 @@ DATA_ROOT = Path("/content/drive/MyDrive/PS26143")
 DEFAULT_WORKSPACE = Path("/content/ps26143_workspace")
 
 
-# ============================================================
-# SELECTED-900 SOURCE DIRECTORIES
-# ============================================================
-
 IMAGE_ROOTS = {
     "oil":
-        DATA_ROOT / "data/extracted/selected_900/oil/images/Oil",
+        DATA_ROOT /
+        "data/extracted/selected_900/oil/images/Oil",
 
     "lookalike":
-        DATA_ROOT / "data/extracted/selected_900/lookalike/images/Lookalike",
+        DATA_ROOT /
+        "data/extracted/selected_900/lookalike/images/Lookalike",
 
     "no_oil":
-        DATA_ROOT / "data/extracted/selected_900/no_oil/images/No_oil",
+        DATA_ROOT /
+        "data/extracted/selected_900/no_oil/images/No_oil",
 }
 
 
 MASK_ROOTS = {
     "oil":
-        DATA_ROOT / "data/extracted/selected_900/oil/masks/Mask_oil",
+        DATA_ROOT /
+        "data/extracted/selected_900/oil/masks/Mask_oil",
 
     "lookalike":
-        DATA_ROOT / "data/extracted/selected_900/lookalike/masks/Mask_lookalike",
+        DATA_ROOT /
+        "data/extracted/selected_900/lookalike/masks/Mask_lookalike",
 
     "no_oil":
-        DATA_ROOT / "data/extracted/selected_900/no_oil/masks/Mask_no_oil",
+        DATA_ROOT /
+        "data/extracted/selected_900/no_oil/masks/Mask_no_oil",
 }
 
 
@@ -50,23 +52,24 @@ MASK_ROOTS = {
 
 def normalize_sar(image):
     """
-    Deterministic per-scene percentile normalization.
+    Per-scene percentile normalization.
 
     Input:
-        [2, H, W], float32 SAR values.
+        [2, H, W]
+        VV + VH SAR values.
 
     Output:
-        [2, H, W], float32 approximately [0, 1].
+        [2, H, W]
+        float32 approximately in [0, 1].
 
-    VV and VH are normalized independently using
-    the 1st and 99th percentiles.
+    VV and VH are normalized independently.
     """
 
     image = image.astype(np.float32)
 
     output = np.zeros_like(
         image,
-        dtype=np.float32,
+        dtype=np.float32
     )
 
     for band in range(image.shape[0]):
@@ -82,12 +85,12 @@ def normalize_sar(image):
 
         low = np.percentile(
             valid,
-            1.0,
+            1.0
         )
 
         high = np.percentile(
             valid,
-            99.0,
+            99.0
         )
 
         if high <= low:
@@ -104,30 +107,26 @@ def normalize_sar(image):
         x = np.clip(
             x,
             low,
-            high,
+            high
         )
 
         output[band] = (
-            (x - low)
-            / (high - low)
+            (x - low) /
+            (high - low)
         )
 
     return output
 
 
 # ============================================================
-# IMAGE RESIZING
+# IMAGE RESIZE
 # ============================================================
 
 def resize_image(image, size):
     """
-    Resize each SAR band using bilinear interpolation.
+    Resize VV and VH independently.
 
-    Input:
-        [2, H, W]
-
-    Output:
-        [2, size, size]
+    Bilinear interpolation.
     """
 
     bands = []
@@ -136,52 +135,54 @@ def resize_image(image, size):
 
         pil = Image.fromarray(
             band.astype(np.float32),
-            mode="F",
+            mode="F"
         )
 
         pil = pil.resize(
             (size, size),
-            Image.Resampling.BILINEAR,
+            Image.Resampling.BILINEAR
         )
 
         bands.append(
             np.asarray(
                 pil,
-                dtype=np.float32,
+                dtype=np.float32
             )
         )
 
     return np.stack(
         bands,
-        axis=0,
+        axis=0
     )
 
 
 # ============================================================
-# MASK RESIZING
+# MASK RESIZE
 # ============================================================
 
 def resize_mask(mask, size):
     """
-    Resize binary mask using nearest-neighbor interpolation.
+    Resize binary mask.
 
-    Output:
-        [size, size], float32 values {0,1}
+    Nearest-neighbor interpolation prevents
+    fractional mask labels.
     """
 
+    mask = mask.astype(np.uint8)
+
     pil = Image.fromarray(
-        mask.astype(np.uint8),
-        mode="L",
+        mask,
+        mode="L"
     )
 
     pil = pil.resize(
         (size, size),
-        Image.Resampling.NEAREST,
+        Image.Resampling.NEAREST
     )
 
     mask = np.asarray(
         pil,
-        dtype=np.uint8,
+        dtype=np.uint8
     )
 
     return (
@@ -190,16 +191,10 @@ def resize_mask(mask, size):
 
 
 # ============================================================
-# TIFF READERS
+# TIFF READING
 # ============================================================
 
 def read_image(path):
-    """
-    Read SAR image.
-
-    Expected:
-        exactly 2 bands.
-    """
 
     with rasterio.open(path) as src:
 
@@ -215,8 +210,8 @@ def read_image(path):
     if image.shape[0] != 2:
 
         raise ValueError(
-            f"Expected exactly 2 bands, "
-            f"got {image.shape[0]}: {path}"
+            f"Expected exactly 2 bands "
+            f"(VV,VH), got {image.shape[0]}: {path}"
         )
 
     return image
@@ -237,7 +232,10 @@ def read_mask(path):
 
 def locate(root, sample_id):
 
-    path = root / f"{int(sample_id):05d}.tif"
+    path = (
+        root /
+        f"{int(sample_id):05d}.tif"
+    )
 
     if not path.exists():
 
@@ -249,7 +247,7 @@ def locate(root, sample_id):
 
 
 # ============================================================
-# PROCESS ONE SPLIT
+# SINGLE SPLIT
 # ============================================================
 
 def process_split(
@@ -270,29 +268,29 @@ def process_split(
         ].copy()
 
     output = (
-        workspace
-        / "processed"
-        / split
+        workspace /
+        "processed" /
+        split
     )
 
     image_out = (
-        output
-        / "images"
+        output /
+        "images"
     )
 
     mask_out = (
-        output
-        / "masks"
+        output /
+        "masks"
     )
 
     image_out.mkdir(
         parents=True,
-        exist_ok=True,
+        exist_ok=True
     )
 
     mask_out.mkdir(
         parents=True,
-        exist_ok=True,
+        exist_ok=True
     )
 
     records = []
@@ -301,13 +299,18 @@ def process_split(
 
     print()
     print("=" * 70)
-    print(f"PROCESSING {split.upper()}")
+    print(
+        f"PROCESSING {split.upper()}"
+    )
     print("=" * 70)
-    print(f"Samples: {total}")
+
+    print(
+        f"Samples: {total}"
+    )
 
     for n, row in enumerate(
         df.itertuples(index=False),
-        start=1,
+        start=1
     ):
 
         dataset = row.dataset
@@ -318,18 +321,14 @@ def process_split(
 
         global_id = row.global_id
 
-        # ----------------------------------------------------
-        # Locate source TIFFs
-        # ----------------------------------------------------
-
         image_path = locate(
             IMAGE_ROOTS[dataset],
-            sample_id,
+            sample_id
         )
 
         mask_path = locate(
             MASK_ROOTS[dataset],
-            sample_id,
+            sample_id
         )
 
         # ----------------------------------------------------
@@ -345,6 +344,53 @@ def process_split(
         )
 
         # ----------------------------------------------------
+        # CRITICAL ALIGNMENT CHECK
+        # ----------------------------------------------------
+
+        if image.shape[-2:] != mask.shape:
+
+            raise ValueError(
+                "\nIMAGE/MASK SHAPE MISMATCH\n"
+                f"global_id : {global_id}\n"
+                f"dataset   : {dataset}\n"
+                f"sample_id : {sample_id}\n"
+                f"image     : {image.shape}\n"
+                f"mask      : {mask.shape}\n"
+                f"image     : {image_path}\n"
+                f"mask      : {mask_path}"
+            )
+
+        # ----------------------------------------------------
+        # Validate image
+        # ----------------------------------------------------
+
+        if not np.isfinite(image).any():
+
+            raise ValueError(
+                f"Image contains no finite values: "
+                f"{image_path}"
+            )
+
+        # ----------------------------------------------------
+        # Validate mask
+        # ----------------------------------------------------
+
+        mask_values = np.unique(mask)
+
+        if not np.all(
+            np.isin(
+                mask_values,
+                [0, 1]
+            )
+        ):
+
+            raise ValueError(
+                f"Non-binary mask detected: "
+                f"{mask_path}; "
+                f"values={mask_values[:20]}"
+            )
+
+        # ----------------------------------------------------
         # Normalize SAR
         # ----------------------------------------------------
 
@@ -358,75 +404,77 @@ def process_split(
 
         image = resize_image(
             image,
-            image_size,
+            image_size
         )
 
         mask = resize_mask(
             mask,
+            image_size
+        )
+
+        # ----------------------------------------------------
+        # Final shape checks
+        # ----------------------------------------------------
+
+        if image.shape != (
+            2,
             image_size,
-        )
+            image_size
+        ):
 
-        # ----------------------------------------------------
-        # Output paths
-        # ----------------------------------------------------
+            raise ValueError(
+                f"Bad processed image shape: "
+                f"{image.shape}"
+            )
 
-        image_file = (
-            image_out
-            / f"{global_id}.npy"
-        )
+        if mask.shape != (
+            image_size,
+            image_size
+        ):
 
-        mask_file = (
-            mask_out
-            / f"{global_id}.npy"
-        )
+            raise ValueError(
+                f"Bad processed mask shape: "
+                f"{mask.shape}"
+            )
 
         # ----------------------------------------------------
         # Save
         # ----------------------------------------------------
 
+        image_file = (
+            image_out /
+            f"{global_id}.npy"
+        )
+
+        mask_file = (
+            mask_out /
+            f"{global_id}.npy"
+        )
+
         np.save(
             image_file,
-            image.astype(
-                np.float32
-            ),
+            image.astype(np.float32)
         )
 
         np.save(
             mask_file,
-            mask.astype(
-                np.float32
-            ),
+            mask.astype(np.float32)
         )
-
-        # ----------------------------------------------------
-        # Manifest record
-        # ----------------------------------------------------
 
         records.append(
             {
-                "global_id":
-                    global_id,
-
-                "dataset":
-                    dataset,
-
-                "sample_id":
-                    sample_id,
-
-                "split":
-                    split,
-
-                "image":
-                    str(image_file),
-
-                "mask":
-                    str(mask_file),
+                "global_id": global_id,
+                "dataset": dataset,
+                "sample_id": sample_id,
+                "split": split,
+                "image": str(
+                    image_file
+                ),
+                "mask": str(
+                    mask_file
+                ),
             }
         )
-
-        # ----------------------------------------------------
-        # Progress
-        # ----------------------------------------------------
 
         if (
             n == 1
@@ -436,23 +484,19 @@ def process_split(
 
             print(
                 f"[{n:3d}/{total}] "
-                f"{100.0 * n / total:6.2f}%"
+                f"{100.0*n/total:6.2f}%"
             )
 
-    # --------------------------------------------------------
-    # Split manifest
-    # --------------------------------------------------------
-
     manifest_out = (
-        output
-        / "manifest.csv"
+        output /
+        "manifest.csv"
     )
 
     pd.DataFrame(
         records
     ).to_csv(
         manifest_out,
-        index=False,
+        index=False
     )
 
     print(
@@ -468,92 +512,75 @@ def process_split(
 
 def main():
 
-    parser = argparse.ArgumentParser(
-        description=(
-            "PS26143 selected-900 "
-            "dataset preprocessing"
-        )
-    )
+    parser = argparse.ArgumentParser()
 
     parser.add_argument(
         "--workspace",
         type=Path,
-        default=DEFAULT_WORKSPACE,
-        help=(
-            "Output workspace. "
-            "Use local Colab storage for "
-            "fast preprocessing."
-        ),
+        default=DEFAULT_WORKSPACE
     )
 
     parser.add_argument(
         "--image-size",
         type=int,
-        default=512,
+        default=512
     )
 
     args = parser.parse_args()
 
     manifest_dir = (
-        DATA_ROOT
-        / "data/manifests"
+        DATA_ROOT /
+        "data/manifests"
     )
-
-    # --------------------------------------------------------
-    # Verify manifests
-    # --------------------------------------------------------
-
-    required_manifests = [
-        "train_manifest.csv",
-        "val_manifest.csv",
-        "test_manifest.csv",
-    ]
-
-    for filename in required_manifests:
-
-        path = (
-            manifest_dir
-            / filename
-        )
-
-        if not path.exists():
-
-            raise FileNotFoundError(
-                f"Missing manifest: {path}"
-            )
-
-    # --------------------------------------------------------
-    # Create workspace
-    # --------------------------------------------------------
 
     args.workspace.mkdir(
         parents=True,
-        exist_ok=True,
+        exist_ok=True
     )
 
     all_records = []
 
+    expected = {
+        "train": 630,
+        "val": 135,
+        "test": 135,
+    }
+
     # --------------------------------------------------------
-    # Process train / val / test
+    # Process all three splits
     # --------------------------------------------------------
 
     for split in [
         "train",
         "val",
-        "test",
+        "test"
     ]:
 
         manifest = (
-            manifest_dir
-            / f"{split}_manifest.csv"
+            manifest_dir /
+            f"{split}_manifest.csv"
         )
+
+        if not manifest.exists():
+
+            raise FileNotFoundError(
+                f"Missing manifest: {manifest}"
+            )
 
         records = process_split(
             manifest,
             split,
             args.workspace,
-            args.image_size,
+            args.image_size
         )
+
+        if len(records) != expected[split]:
+
+            raise RuntimeError(
+                f"{split}: expected "
+                f"{expected[split]} records, "
+                f"got {len(records)}"
+            )
 
         all_records.extend(
             records
@@ -563,23 +590,33 @@ def main():
     # Combined manifest
     # --------------------------------------------------------
 
-    processed_dir = (
-        args.workspace
-        / "processed"
-    )
-
     combined = pd.DataFrame(
         all_records
     )
 
+    if len(combined) != 900:
+
+        raise RuntimeError(
+            f"Expected 900 processed "
+            f"samples, got {len(combined)}"
+        )
+
+    if combined["global_id"].duplicated().any():
+
+        raise RuntimeError(
+            "Duplicate global_id detected "
+            "in processed dataset."
+        )
+
     combined_path = (
-        processed_dir
-        / "processed_manifest.csv"
+        args.workspace /
+        "processed" /
+        "processed_manifest.csv"
     )
 
     combined.to_csv(
         combined_path,
-        index=False,
+        index=False
     )
 
     # --------------------------------------------------------
@@ -588,15 +625,16 @@ def main():
 
     print()
     print("=" * 70)
-    print("PREPROCESSING COMPLETE")
+    print(
+        "PREPROCESSING COMPLETE"
+    )
     print("=" * 70)
 
     print(
-        f"Total: {len(combined)}"
+        f"Total samples: {len(combined)}"
     )
 
     print()
-
     print(
         combined.groupby(
             ["split", "dataset"]
@@ -604,15 +642,13 @@ def main():
     )
 
     print()
-
-    print("Processed output:")
-    print(processed_dir)
-
-    print()
+    print(
+        "Output:"
+    )
 
     print(
-        f"Combined manifest: "
-        f"{combined_path}"
+        args.workspace /
+        "processed"
     )
 
 
