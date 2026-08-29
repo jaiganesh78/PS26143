@@ -1,5 +1,7 @@
+
 from pathlib import Path
 import csv
+import os
 import random
 import time
 
@@ -14,7 +16,7 @@ from src.training.losses import BCEDiceLoss
 
 
 # ============================================================
-# PS26143 — BASELINE SEGMENTATION TRAINING
+# PS26143 — RESUMABLE BASELINE SEGMENTATION TRAINING
 # ============================================================
 
 SEED = 42
@@ -56,6 +58,20 @@ NUM_WORKERS = 2
 
 THRESHOLD = 0.5
 
+# IMPORTANT:
+# Automatically continue from the last checkpoint if one exists.
+RESUME = True
+
+
+# ============================================================
+# CHECKPOINT PATHS
+# ============================================================
+
+BEST_CHECKPOINT = CHECKPOINT_DIR / "oil_seg_v1_best.pt"
+LAST_CHECKPOINT = CHECKPOINT_DIR / "oil_seg_v1_last.pt"
+
+LOG_FILE = LOG_DIR / "oil_seg_v1_training.csv"
+
 
 # ============================================================
 # REPRODUCIBILITY
@@ -64,7 +80,6 @@ THRESHOLD = 0.5
 def seed_everything(seed):
     random.seed(seed)
     np.random.seed(seed)
-
     torch.manual_seed(seed)
 
     if torch.cuda.is_available():
@@ -189,9 +204,7 @@ def train_one_epoch(
             non_blocking=True,
         )
 
-        optimizer.zero_grad(
-            set_to_none=True
-        )
+        optimizer.zero_grad(set_to_none=True)
 
         with torch.autocast(
             device_type=device.type,
@@ -319,29 +332,311 @@ def validate(
 # CHECKPOINT
 # ============================================================
 
+def checkpoint_payload(
+    model,
+    optimizer,
+    scheduler,
+    scaler,
+    epoch,
+    best_val_dice,
+    epochs_without_improvement,
+):
+    return {
+        "epoch": epoch,
+
+        "model_state_dict": model.state_dict(),
+
+        "optimizer_state_dict": optimizer.state_dict(),
+
+        "scheduler_state_dict": scheduler.state_dict(),
+
+        "scaler_state_dict": scaler.state_dict(),
+
+        "best_val_dice": best_val_dice,
+
+        "epochs_without_improvement":
+            epochs_without_improvement,
+
+        "seed": SEED,
+
+        "architecture": "unet",
+
+        "encoder": "resnet34",
+
+        "encoder_weights": "imagenet",
+
+        "in_channels": 2,
+
+        "classes": 1,
+
+        "image_size": IMAGE_SIZE,
+
+        "batch_size": BATCH_SIZE,
+
+        "learning_rate": LEARNING_RATE,
+
+        "weight_decay": WEIGHT_DECAY,
+
+        "threshold": THRESHOLD,
+
+        "python_version": os.sys.version,
+
+        "torch_version": torch.__version__,
+
+        "cuda_device": (
+            torch.cuda.get_device_name(0)
+            if torch.cuda.is_available()
+            else "cpu"
+        ),
+
+        "python_random_state": random.getstate(),
+
+        "numpy_random_state": np.random.get_state(),
+
+        "torch_random_state": torch.get_rng_state(),
+
+        "torch_cuda_random_state": (
+            torch.cuda.get_rng_state_all()
+            if torch.cuda.is_available()
+            else None
+        ),
+    }
+
+
+def atomic_torch_save(payload, path):
+    """
+    Save checkpoint to a temporary file first,
+    then atomically replace the destination.
+
+    This reduces the risk of leaving a corrupt checkpoint
+    if the runtime dies while writing.
+    """
+
+    temporary = path.with_suffix(
+        path.suffix + ".tmp"
+    )
+
+    torch.save(payload, temporary)
+
+    os.replace(temporary, path)
+
+
 def save_checkpoint(
     path,
     model,
     optimizer,
     scheduler,
+    scaler,
     epoch,
     best_val_dice,
+    epochs_without_improvement,
 ):
-    torch.save(
-        {
-            "epoch": epoch,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
-            "best_val_dice": best_val_dice,
-            "seed": SEED,
-            "architecture": "unet",
-            "encoder": "resnet34",
-            "in_channels": 2,
-            "classes": 1,
-        },
+    payload = checkpoint_payload(
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+        epoch=epoch,
+        best_val_dice=best_val_dice,
+        epochs_without_improvement=
+            epochs_without_improvement,
+    )
+
+    atomic_torch_save(
+        payload,
         path,
     )
+
+
+# ============================================================
+# RESUME
+# ============================================================
+
+def restore_checkpoint(
+    path,
+    model,
+    optimizer,
+    scheduler,
+    scaler,
+    device,
+):
+    print()
+    print("=" * 70)
+    print("RESUMING FROM CHECKPOINT")
+    print("=" * 70)
+
+    checkpoint = torch.load(
+        path,
+        map_location=device,
+        weights_only=False,
+    )
+
+    model.load_state_dict(
+        checkpoint["model_state_dict"]
+    )
+
+    optimizer.load_state_dict(
+        checkpoint["optimizer_state_dict"]
+    )
+
+    scheduler.load_state_dict(
+        checkpoint["scheduler_state_dict"]
+    )
+
+    if "scaler_state_dict" in checkpoint:
+        scaler.load_state_dict(
+            checkpoint["scaler_state_dict"]
+        )
+
+    # Restore RNG states where available.
+    if "python_random_state" in checkpoint:
+        random.setstate(
+            checkpoint["python_random_state"]
+        )
+
+    if "numpy_random_state" in checkpoint:
+        np.random.set_state(
+            checkpoint["numpy_random_state"]
+        )
+
+    if "torch_random_state" in checkpoint:
+        torch.set_rng_state(
+            checkpoint["torch_random_state"]
+        )
+
+    if (
+        torch.cuda.is_available()
+        and checkpoint.get(
+            "torch_cuda_random_state"
+        ) is not None
+    ):
+        torch.cuda.set_rng_state_all(
+            checkpoint["torch_cuda_random_state"]
+        )
+
+    previous_epoch = int(
+        checkpoint["epoch"]
+    )
+
+    best_val_dice = float(
+        checkpoint["best_val_dice"]
+    )
+
+    epochs_without_improvement = int(
+        checkpoint.get(
+            "epochs_without_improvement",
+            0,
+        )
+    )
+
+    start_epoch = previous_epoch + 1
+
+    print(
+        "Checkpoint epoch        :",
+        previous_epoch,
+    )
+
+    print(
+        "Starting epoch          :",
+        start_epoch,
+    )
+
+    print(
+        "Best validation Dice    :",
+        f"{best_val_dice:.5f}",
+    )
+
+    print(
+        "No-improvement epochs   :",
+        epochs_without_improvement,
+    )
+
+    print(
+        "Checkpoint              :",
+        path,
+    )
+
+    print(
+        "RESUME SUCCESSFUL"
+    )
+
+    return (
+        start_epoch,
+        best_val_dice,
+        epochs_without_improvement,
+    )
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+LOG_COLUMNS = [
+    "epoch",
+    "train_loss",
+    "train_dice",
+    "train_iou",
+    "val_loss",
+    "val_dice",
+    "val_iou",
+    "learning_rate",
+    "epoch_seconds",
+]
+
+
+def prepare_log_file(resuming):
+    """
+    Do not erase the training history when resuming.
+    """
+
+    if resuming and LOG_FILE.exists():
+        return
+
+    with LOG_FILE.open(
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as f:
+
+        writer = csv.writer(f)
+
+        writer.writerow(
+            LOG_COLUMNS
+        )
+
+
+def append_log(
+    epoch,
+    train_loss,
+    train_dice,
+    train_iou,
+    val_loss,
+    val_dice,
+    val_iou,
+    learning_rate,
+    epoch_seconds,
+):
+    with LOG_FILE.open(
+        "a",
+        newline="",
+        encoding="utf-8",
+    ) as f:
+
+        writer = csv.writer(f)
+
+        writer.writerow(
+            [
+                epoch,
+                train_loss,
+                train_dice,
+                train_iou,
+                val_loss,
+                val_dice,
+                val_iou,
+                learning_rate,
+                epoch_seconds,
+            ]
+        )
 
 
 # ============================================================
@@ -372,7 +667,8 @@ def main():
         print(
             "VRAM    :",
             round(
-                torch.cuda.get_device_properties(0).total_memory
+                torch.cuda.get_device_properties(0)
+                .total_memory
                 / (1024 ** 3),
                 2,
             ),
@@ -383,20 +679,36 @@ def main():
 
         device = torch.device("cpu")
 
-        print("WARNING: CUDA unavailable.")
+        print(
+            "WARNING: CUDA unavailable."
+        )
 
     print()
-    print("Train manifest:", TRAIN_MANIFEST)
-    print("Val manifest  :", VAL_MANIFEST)
+    print(
+        "Processed root:",
+        PROCESSED_ROOT,
+    )
+
+    print(
+        "Train manifest:",
+        TRAIN_MANIFEST,
+    )
+
+    print(
+        "Val manifest  :",
+        VAL_MANIFEST,
+    )
 
     if not TRAIN_MANIFEST.exists():
         raise FileNotFoundError(
-            f"Training manifest missing: {TRAIN_MANIFEST}"
+            f"Training manifest missing: "
+            f"{TRAIN_MANIFEST}"
         )
 
     if not VAL_MANIFEST.exists():
         raise FileNotFoundError(
-            f"Validation manifest missing: {VAL_MANIFEST}"
+            f"Validation manifest missing: "
+            f"{VAL_MANIFEST}"
         )
 
     train_records = load_records(
@@ -408,11 +720,27 @@ def main():
     )
 
     print()
-    print("Training samples  :", len(train_records))
-    print("Validation samples:", len(val_records))
+    print(
+        "Training samples  :",
+        len(train_records),
+    )
 
-    assert len(train_records) == 630
-    assert len(val_records) == 135
+    print(
+        "Validation samples:",
+        len(val_records),
+    )
+
+    if len(train_records) != 630:
+        raise ValueError(
+            f"Expected 630 training samples, "
+            f"found {len(train_records)}"
+        )
+
+    if len(val_records) != 135:
+        raise ValueError(
+            f"Expected 135 validation samples, "
+            f"found {len(val_records)}"
+        )
 
     # --------------------------------------------------------
     # DATASETS
@@ -472,10 +800,22 @@ def main():
         for p in model.parameters()
     )
 
-    print("Architecture : U-Net")
-    print("Encoder      : ResNet34")
-    print("Input        : 2 channels")
-    print("Output       : 1 channel")
+    print(
+        "Architecture : U-Net"
+    )
+
+    print(
+        "Encoder      : ResNet34"
+    )
+
+    print(
+        "Input        : 2 channels"
+    )
+
+    print(
+        "Output       : 1 channel"
+    )
+
     print(
         "Parameters   :",
         f"{parameter_count:,}",
@@ -490,11 +830,19 @@ def main():
         dice_weight=DICE_WEIGHT,
     )
 
+    # --------------------------------------------------------
+    # OPTIMIZER
+    # --------------------------------------------------------
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=LEARNING_RATE,
         weight_decay=WEIGHT_DECAY,
     )
+
+    # --------------------------------------------------------
+    # SCHEDULER
+    # --------------------------------------------------------
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
@@ -503,56 +851,129 @@ def main():
         factor=0.5,
     )
 
+    # --------------------------------------------------------
+    # AMP
+    # --------------------------------------------------------
+
     scaler = torch.amp.GradScaler(
         "cuda",
         enabled=device.type == "cuda",
     )
 
     # --------------------------------------------------------
-    # LOG
+    # RESUME STATE
     # --------------------------------------------------------
 
-    log_file = LOG_DIR / "oil_seg_v1_training.csv"
-
-    with log_file.open(
-        "w",
-        newline="",
-        encoding="utf-8",
-    ) as f:
-
-        writer = csv.writer(f)
-
-        writer.writerow(
-            [
-                "epoch",
-                "train_loss",
-                "train_dice",
-                "train_iou",
-                "val_loss",
-                "val_dice",
-                "val_iou",
-                "learning_rate",
-                "epoch_seconds",
-            ]
-        )
-
+    start_epoch = 1
     best_val_dice = -1.0
     epochs_without_improvement = 0
 
-    best_checkpoint = (
-        CHECKPOINT_DIR / "oil_seg_v1_best.pt"
+    resuming = (
+        RESUME
+        and LAST_CHECKPOINT.exists()
     )
 
-    last_checkpoint = (
-        CHECKPOINT_DIR / "oil_seg_v1_last.pt"
+    if resuming:
+
+        (
+            start_epoch,
+            best_val_dice,
+            epochs_without_improvement,
+        ) = restore_checkpoint(
+            LAST_CHECKPOINT,
+            model,
+            optimizer,
+            scheduler,
+            scaler,
+            device,
+        )
+
+    prepare_log_file(
+        resuming=resuming
     )
+
+    # --------------------------------------------------------
+    # TRAINING HEADER
+    # --------------------------------------------------------
 
     print()
     print("=" * 70)
     print("TRAINING")
     print("=" * 70)
 
-    for epoch in range(1, EPOCHS + 1):
+    print()
+    print(
+        "Epochs              :",
+        EPOCHS,
+    )
+
+    print(
+        "Batch size          :",
+        BATCH_SIZE,
+    )
+
+    print(
+        "Learning rate       :",
+        LEARNING_RATE,
+    )
+
+    print(
+        "Mixed precision     :",
+        device.type == "cuda",
+    )
+
+    print(
+        "Checkpoint interval :",
+        "every epoch",
+    )
+
+    print(
+        "Resume enabled      :",
+        RESUME,
+    )
+
+    print(
+        "Best checkpoint     :",
+        BEST_CHECKPOINT,
+    )
+
+    print(
+        "Last checkpoint     :",
+        LAST_CHECKPOINT,
+    )
+
+    print(
+        "Training log        :",
+        LOG_FILE,
+    )
+
+    # --------------------------------------------------------
+    # IF ALREADY COMPLETE
+    # --------------------------------------------------------
+
+    if start_epoch > EPOCHS:
+
+        print()
+        print(
+            "Requested training epochs "
+            "already completed."
+        )
+
+        print(
+            "Best validation Dice:",
+            f"{best_val_dice:.5f}",
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # EPOCH LOOP
+    # --------------------------------------------------------
+
+    for epoch in range(
+        start_epoch,
+        EPOCHS + 1,
+    ):
 
         start = time.time()
 
@@ -560,26 +981,33 @@ def main():
         print(
             f"Epoch {epoch:02d}/{EPOCHS}"
         )
+
         print("-" * 70)
 
-        train_loss, train_dice, train_iou = train_one_epoch(
-            model,
-            train_loader,
-            optimizer,
-            criterion,
-            scaler,
-            device,
-            epoch,
+        train_loss, train_dice, train_iou = (
+            train_one_epoch(
+                model,
+                train_loader,
+                optimizer,
+                criterion,
+                scaler,
+                device,
+                epoch,
+            )
         )
 
-        val_loss, val_dice, val_iou = validate(
-            model,
-            val_loader,
-            criterion,
-            device,
+        val_loss, val_dice, val_iou = (
+            validate(
+                model,
+                val_loader,
+                criterion,
+                device,
+            )
         )
 
-        scheduler.step(val_dice)
+        scheduler.step(
+            val_dice
+        )
 
         lr = optimizer.param_groups[0]["lr"]
 
@@ -589,52 +1017,54 @@ def main():
         print(
             f"Epoch {epoch:02d} RESULT"
         )
+
         print(
             f"  Train loss : {train_loss:.5f}"
         )
+
         print(
             f"  Train Dice : {train_dice:.5f}"
         )
+
         print(
             f"  Train IoU  : {train_iou:.5f}"
         )
+
         print(
             f"  Val loss   : {val_loss:.5f}"
         )
+
         print(
             f"  Val Dice   : {val_dice:.5f}"
         )
+
         print(
             f"  Val IoU    : {val_iou:.5f}"
         )
+
         print(
             f"  LR         : {lr:.7f}"
         )
+
         print(
             f"  Time       : {elapsed:.1f}s"
         )
 
-        with log_file.open(
-            "a",
-            newline="",
-            encoding="utf-8",
-        ) as f:
+        # ----------------------------------------------------
+        # LOG
+        # ----------------------------------------------------
 
-            writer = csv.writer(f)
-
-            writer.writerow(
-                [
-                    epoch,
-                    train_loss,
-                    train_dice,
-                    train_iou,
-                    val_loss,
-                    val_dice,
-                    val_iou,
-                    lr,
-                    elapsed,
-                ]
-            )
+        append_log(
+            epoch=epoch,
+            train_loss=train_loss,
+            train_dice=train_dice,
+            train_iou=train_iou,
+            val_loss=val_loss,
+            val_dice=val_dice,
+            val_iou=val_iou,
+            learning_rate=lr,
+            epoch_seconds=elapsed,
+        )
 
         # ----------------------------------------------------
         # BEST CHECKPOINT
@@ -643,23 +1073,28 @@ def main():
         if val_dice > best_val_dice:
 
             best_val_dice = val_dice
+
             epochs_without_improvement = 0
 
             save_checkpoint(
-                best_checkpoint,
+                BEST_CHECKPOINT,
                 model,
                 optimizer,
                 scheduler,
+                scaler,
                 epoch,
                 best_val_dice,
+                epochs_without_improvement,
             )
 
             print()
             print(
                 "  ★ NEW BEST CHECKPOINT"
             )
+
             print(
-                f"  Val Dice: {best_val_dice:.5f}"
+                f"  Val Dice: "
+                f"{best_val_dice:.5f}"
             )
 
         else:
@@ -668,15 +1103,30 @@ def main():
 
         # ----------------------------------------------------
         # LAST CHECKPOINT
+        #
+        # ALWAYS saved.
+        # This is what makes Colab recovery possible.
         # ----------------------------------------------------
 
         save_checkpoint(
-            last_checkpoint,
+            LAST_CHECKPOINT,
             model,
             optimizer,
             scheduler,
+            scaler,
             epoch,
             best_val_dice,
+            epochs_without_improvement,
+        )
+
+        print()
+        print(
+            "  ✓ LAST CHECKPOINT SAVED"
+        )
+
+        print(
+            "  ",
+            LAST_CHECKPOINT,
         )
 
         # ----------------------------------------------------
@@ -692,12 +1142,17 @@ def main():
             print(
                 "EARLY STOPPING"
             )
+
             print(
                 f"No validation Dice improvement "
                 f"for {EARLY_STOPPING_PATIENCE} epochs."
             )
 
             break
+
+    # --------------------------------------------------------
+    # COMPLETE
+    # --------------------------------------------------------
 
     print()
     print("=" * 70)
@@ -711,17 +1166,33 @@ def main():
     )
 
     print()
-    print("Best checkpoint:")
-    print(best_checkpoint)
+    print(
+        "Best checkpoint:"
+    )
+
+    print(
+        BEST_CHECKPOINT
+    )
 
     print()
-    print("Last checkpoint:")
-    print(last_checkpoint)
+    print(
+        "Last checkpoint:"
+    )
+
+    print(
+        LAST_CHECKPOINT
+    )
 
     print()
-    print("Training log:")
-    print(log_file)
+    print(
+        "Training log:"
+    )
+
+    print(
+        LOG_FILE
+    )
 
 
 if __name__ == "__main__":
     main()
+
