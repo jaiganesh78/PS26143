@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import csv
+import argparse
 import json
-import random
 from pathlib import Path
 
 import numpy as np
@@ -12,192 +11,126 @@ from torch.utils.data import DataLoader
 
 from src.datasets.oil_dataset import OilSegmentationDataset
 from src.models.segmentation_model import build_model
-from src.training.losses import BCEDiceLoss
+from src.training.losses import V2SegmentationLoss
 
 
 # ============================================================
-# PS26143 — FINAL TEST EVALUATION
+# DEFAULTS
 # ============================================================
 
-SEED = 42
-
-DRIVE_ROOT = Path("/content/drive/MyDrive/PS26143")
-
-PROCESSED_ROOT = DRIVE_ROOT / "data/processed"
-
-TEST_MANIFEST = (
-    PROCESSED_ROOT / "test/manifest.csv"
+DRIVE_ROOT = Path(
+    "/content/drive/MyDrive/PS26143"
 )
 
-CHECKPOINT = (
-    DRIVE_ROOT / "checkpoints/oil_seg_v1_best.pt"
+DEFAULT_TEST_MANIFEST = (
+    DRIVE_ROOT
+    / "data/processed/test/manifest.csv"
 )
 
-OUTPUT_DIR = (
-    DRIVE_ROOT / "evaluation/oil_seg_v1"
+DEFAULT_V1_CHECKPOINT = (
+    DRIVE_ROOT
+    / "checkpoints/oil_seg_v1_best.pt"
 )
 
-RESULTS_CSV = OUTPUT_DIR / "test_predictions.csv"
-SUMMARY_JSON = OUTPUT_DIR / "test_summary.json"
-
-BATCH_SIZE = 16
-NUM_WORKERS = 0
-
-THRESHOLD = 0.5
-
-
-# ============================================================
-# REPRODUCIBILITY
-# ============================================================
-
-def set_seed(seed: int = 42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+DEFAULT_V2_CHECKPOINT = (
+    DRIVE_ROOT
+    / "checkpoints/oil_seg_v2_best.pt"
+)
 
 
 # ============================================================
 # METRICS
 # ============================================================
 
-def binary_metrics(
-    prediction: torch.Tensor,
-    target: torch.Tensor,
-    eps: float = 1e-7,
+def safe_divide(a, b):
+    if b == 0:
+        return 0.0
+
+    return float(a / b)
+
+
+def segmentation_metrics(
+    prediction,
+    target,
 ):
-    """
-    Pixel-level binary segmentation metrics.
+    prediction = prediction.astype(bool)
+    target = target.astype(bool)
 
-    prediction: [N,1,H,W] boolean
-    target:     [N,1,H,W] boolean
-    """
-
-    prediction = prediction.bool()
-    target = target.bool()
-
-    tp = (prediction & target).sum().item()
-    fp = (prediction & ~target).sum().item()
-    fn = (~prediction & target).sum().item()
-    tn = (~prediction & ~target).sum().item()
-
-    intersection = tp
-    union = tp + fp + fn
-
-    dice = (
-        2.0 * tp /
-        (2.0 * tp + fp + fn + eps)
+    tp = int(
+        np.logical_and(
+            prediction,
+            target,
+        ).sum()
     )
 
-    iou = (
-        tp /
-        (union + eps)
+    fp = int(
+        np.logical_and(
+            prediction,
+            ~target,
+        ).sum()
     )
 
-    precision = (
-        tp /
-        (tp + fp + eps)
+    fn = int(
+        np.logical_and(
+            ~prediction,
+            target,
+        ).sum()
     )
 
-    recall = (
-        tp /
-        (tp + fn + eps)
+    tn = int(
+        np.logical_and(
+            ~prediction,
+            ~target,
+        ).sum()
     )
 
-    f1 = (
-        2.0 * precision * recall /
-        (precision + recall + eps)
+    dice = safe_divide(
+        2.0 * tp,
+        2.0 * tp + fp + fn,
     )
 
-    accuracy = (
-        (tp + tn) /
-        (tp + tn + fp + fn + eps)
+    iou = safe_divide(
+        tp,
+        tp + fp + fn,
     )
 
-    return {
-        "tp": int(tp),
-        "fp": int(fp),
-        "fn": int(fn),
-        "tn": int(tn),
-        "dice": float(dice),
-        "iou": float(iou),
-        "precision": float(precision),
-        "recall": float(recall),
-        "f1": float(f1),
-        "accuracy": float(accuracy),
-        "target_positive_pixels": int(target.sum().item()),
-        "predicted_positive_pixels": int(prediction.sum().item()),
-    }
-
-
-def aggregate_counts(records):
-    """
-    Aggregate TP/FP/FN/TN and derive metrics.
-    """
-
-    tp = sum(r["tp"] for r in records)
-    fp = sum(r["fp"] for r in records)
-    fn = sum(r["fn"] for r in records)
-    tn = sum(r["tn"] for r in records)
-
-    eps = 1e-7
-
-    dice = (
-        2.0 * tp /
-        (2.0 * tp + fp + fn + eps)
+    precision = safe_divide(
+        tp,
+        tp + fp,
     )
 
-    iou = (
-        tp /
-        (tp + fp + fn + eps)
+    recall = safe_divide(
+        tp,
+        tp + fn,
     )
 
-    precision = (
-        tp /
-        (tp + fp + eps)
+    f1 = safe_divide(
+        2.0 * precision * recall,
+        precision + recall,
     )
 
-    recall = (
-        tp /
-        (tp + fn + eps)
-    )
-
-    f1 = (
-        2.0 * precision * recall /
-        (precision + recall + eps)
-    )
-
-    accuracy = (
-        (tp + tn) /
-        (tp + tn + fp + fn + eps)
-    )
-
-    target_positive = sum(
-        r["target_positive_pixels"]
-        for r in records
-    )
-
-    predicted_positive = sum(
-        r["predicted_positive_pixels"]
-        for r in records
+    accuracy = safe_divide(
+        tp + tn,
+        tp + tn + fp + fn,
     )
 
     return {
-        "samples": len(records),
-        "tp": int(tp),
-        "fp": int(fp),
-        "fn": int(fn),
-        "tn": int(tn),
-        "dice": float(dice),
-        "iou": float(iou),
-        "precision": float(precision),
-        "recall": float(recall),
-        "f1": float(f1),
-        "accuracy": float(accuracy),
-        "target_positive_pixels": int(target_positive),
-        "predicted_positive_pixels": int(predicted_positive),
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+        "tn": tn,
+        "dice": dice,
+        "iou": iou,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "accuracy": accuracy,
+        "target_positive_pixels": int(
+            target.sum()
+        ),
+        "predicted_positive_pixels": int(
+            prediction.sum()
+        ),
     }
 
 
@@ -205,52 +138,35 @@ def aggregate_counts(records):
 # CHECKPOINT LOADING
 # ============================================================
 
-def load_checkpoint(model, checkpoint_path, device):
-    """
-    Supports checkpoints saved either as:
-
-        {
-            "model_state_dict": ...
-        }
-
-    or a raw state_dict.
-    """
-
+def load_checkpoint(
+    model,
+    checkpoint_path,
+    device,
+):
     checkpoint = torch.load(
         checkpoint_path,
         map_location=device,
-        weights_only=False,
     )
 
-    if isinstance(checkpoint, dict):
-
+    if isinstance(
+        checkpoint,
+        dict,
+    ):
         if "model_state_dict" in checkpoint:
-            state_dict = checkpoint["model_state_dict"]
-
+            state_dict = checkpoint[
+                "model_state_dict"
+            ]
         elif "state_dict" in checkpoint:
-            state_dict = checkpoint["state_dict"]
-
+            state_dict = checkpoint[
+                "state_dict"
+            ]
         else:
-            # Raw state_dict case.
             state_dict = checkpoint
-
     else:
-        raise RuntimeError(
-            "Unsupported checkpoint format."
-        )
-
-    # Handle DataParallel checkpoints.
-    cleaned = {}
-
-    for key, value in state_dict.items():
-
-        if key.startswith("module."):
-            key = key[len("module."):]
-
-        cleaned[key] = value
+        state_dict = checkpoint
 
     model.load_state_dict(
-        cleaned,
+        state_dict,
         strict=True,
     )
 
@@ -258,19 +174,53 @@ def load_checkpoint(model, checkpoint_path, device):
 
 
 # ============================================================
-# MAIN EVALUATION
+# MAIN
 # ============================================================
 
 def main():
 
-    set_seed(SEED)
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        required=True,
+    )
+
+    parser.add_argument(
+        "--test-manifest",
+        type=Path,
+        default=DEFAULT_TEST_MANIFEST,
+    )
+
+    parser.add_argument(
+        "--experiment",
+        type=str,
+        required=True,
+    )
+
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.5,
+    )
+
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=16,
+    )
+
+    args = parser.parse_args()
 
     print("=" * 70)
-    print("PS26143 — FINAL TEST SET EVALUATION")
+    print(
+        f"PS26143 — {args.experiment.upper()} TEST EVALUATION"
+    )
     print("=" * 70)
 
     # --------------------------------------------------------
-    # Device
+    # DEVICE
     # --------------------------------------------------------
 
     device = torch.device(
@@ -284,131 +234,102 @@ def main():
 
     if device.type == "cuda":
         print(
-            "GPU   :",
+            "GPU:",
             torch.cuda.get_device_name(0),
         )
 
-        print(
-            "VRAM  :",
-            round(
-                torch.cuda.get_device_properties(0).total_memory
-                / (1024 ** 3),
-                2,
-            ),
-            "GiB",
+    # --------------------------------------------------------
+    # INPUT CHECKS
+    # --------------------------------------------------------
+
+    if not args.checkpoint.exists():
+        raise FileNotFoundError(
+            args.checkpoint
+        )
+
+    if not args.test_manifest.exists():
+        raise FileNotFoundError(
+            args.test_manifest
         )
 
     # --------------------------------------------------------
-    # Paths
+    # MANIFEST
     # --------------------------------------------------------
 
-    print()
-    print("=" * 70)
-    print("INPUTS")
-    print("=" * 70)
-
-    print("Test manifest :", TEST_MANIFEST)
-    print("Checkpoint    :", CHECKPOINT)
-    print("Output        :", OUTPUT_DIR)
-
-    if not TEST_MANIFEST.exists():
-        raise FileNotFoundError(
-            f"Missing test manifest: {TEST_MANIFEST}"
-        )
-
-    if not CHECKPOINT.exists():
-        raise FileNotFoundError(
-            f"Missing best checkpoint: {CHECKPOINT}"
-        )
-
-    OUTPUT_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
+    df = pd.read_csv(
+        args.test_manifest
     )
 
-    # --------------------------------------------------------
-    # Test manifest
-    # --------------------------------------------------------
-
-    test_df = pd.read_csv(TEST_MANIFEST)
-
-    expected = 135
-
-    if len(test_df) != expected:
+    if len(df) != 135:
         raise RuntimeError(
-            f"Expected {expected} test samples, "
-            f"found {len(test_df)}."
+            f"Expected 135 test samples, "
+            f"found {len(df)}"
         )
 
-    if test_df["global_id"].duplicated().any():
+    required_columns = {
+        "global_id",
+        "dataset",
+        "image",
+        "mask",
+    }
+
+    missing_columns = (
+        required_columns
+        - set(df.columns)
+    )
+
+    if missing_columns:
         raise RuntimeError(
-            "Duplicate global IDs found in test manifest."
+            f"Manifest missing columns: "
+            f"{sorted(missing_columns)}"
         )
 
     print()
-    print("Test samples:", len(test_df))
-
-    print()
-    print("Test distribution:")
     print(
-        test_df["dataset"]
-        .value_counts()
-        .sort_index()
+        "Test samples:",
+        len(df),
     )
-
-    # --------------------------------------------------------
-    # Verify referenced files
-    # --------------------------------------------------------
-
-    missing_images = [
-        p for p in test_df["image"]
-        if not Path(p).exists()
-    ]
-
-    missing_masks = [
-        p for p in test_df["mask"]
-        if not Path(p).exists()
-    ]
-
-    if missing_images:
-        raise FileNotFoundError(
-            f"Missing test images: "
-            f"{missing_images[:5]}"
-        )
-
-    if missing_masks:
-        raise FileNotFoundError(
-            f"Missing test masks: "
-            f"{missing_masks[:5]}"
-        )
 
     print()
-    print("Test image paths: VERIFIED")
-    print("Test mask paths : VERIFIED")
-
-    # --------------------------------------------------------
-    # Dataset
-    # --------------------------------------------------------
-
-    records = test_df.to_dict(
-        orient="records"
+    print(
+        "Dataset distribution:"
     )
 
-    dataset = OilSegmentationDataset(
-        records,
-        augment=False,
-    )
-
-    loader = DataLoader(
-        dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=NUM_WORKERS,
-        pin_memory=(device.type == "cuda"),
+    print(
+        df["dataset"].value_counts()
     )
 
     # --------------------------------------------------------
-    # Model
+    # PATH VALIDATION
+    # --------------------------------------------------------
+
+    for _, row in df.iterrows():
+
+        image_path = Path(
+            row["image"]
+        )
+
+        mask_path = Path(
+            row["mask"]
+        )
+
+        if not image_path.exists():
+            raise FileNotFoundError(
+                image_path
+            )
+
+        if not mask_path.exists():
+            raise FileNotFoundError(
+                mask_path
+            )
+
+    print()
+    print(
+        "All test image/mask paths verified."
+    )
+
+    # --------------------------------------------------------
+    # MODEL
     # --------------------------------------------------------
 
     print()
@@ -424,41 +345,56 @@ def main():
         classes=1,
     )
 
-    model.to(device)
+    model = model.to(device)
 
-    parameter_count = sum(
-        p.numel()
-        for p in model.parameters()
+    print(
+        "Architecture : U-Net"
     )
 
-    print("Architecture : U-Net")
-    print("Encoder      : ResNet34")
-    print("Input        : 2 channels")
-    print("Output       : 1 channel")
     print(
-        "Parameters   :",
-        f"{parameter_count:,}",
+        "Encoder      : ResNet34"
+    )
+
+    print(
+        "Input        : 2 channels"
+    )
+
+    print(
+        "Output       : 1 channel"
     )
 
     # --------------------------------------------------------
-    # Load BEST checkpoint
+    # CHECKPOINT
     # --------------------------------------------------------
 
     print()
-    print("=" * 70)
-    print("LOADING BEST CHECKPOINT")
-    print("=" * 70)
+    print(
+        "=" * 70
+    )
+
+    print(
+        "LOADING CHECKPOINT"
+    )
+
+    print(
+        "=" * 70
+    )
 
     checkpoint = load_checkpoint(
         model,
-        CHECKPOINT,
+        args.checkpoint,
         device,
     )
 
-    print("Checkpoint:", CHECKPOINT)
-    print("Checkpoint loaded successfully.")
+    print(
+        "Checkpoint:",
+        args.checkpoint,
+    )
 
-    if isinstance(checkpoint, dict):
+    if isinstance(
+        checkpoint,
+        dict,
+    ):
 
         if "epoch" in checkpoint:
             print(
@@ -469,266 +405,563 @@ def main():
         if "best_val_dice" in checkpoint:
             print(
                 "Best validation Dice:",
-                checkpoint["best_val_dice"],
+                checkpoint[
+                    "best_val_dice"
+                ],
             )
 
     # --------------------------------------------------------
-    # Evaluation
+    # DATASET
     # --------------------------------------------------------
 
-    print()
-    print("=" * 70)
-    print("EVALUATING 135 HELD-OUT TEST SAMPLES")
-    print("=" * 70)
+    records = df.to_dict(
+        "records"
+    )
+
+    dataset = OilSegmentationDataset(
+        records,
+        augment=False,
+    )
+
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=(
+            device.type == "cuda"
+        ),
+    )
+
+    # --------------------------------------------------------
+    # PREDICTION
+    # --------------------------------------------------------
 
     model.eval()
 
-    scaler_enabled = (
-        device.type == "cuda"
-    )
-
     per_sample = []
+
+    total_tp = 0
+    total_fp = 0
+    total_fn = 0
+    total_tn = 0
+
+    dataset_accumulator = {}
+
+    print()
+    print("=" * 70)
+    print("GENERATING TEST PREDICTIONS")
+    print("=" * 70)
 
     with torch.no_grad():
 
-        for batch_index, batch in enumerate(
-            loader,
-            start=1,
-        ):
+        processed = 0
 
-            images = batch["image"].to(
+        for batch in loader:
+
+            images = batch[
+                "image"
+            ].to(
                 device,
                 non_blocking=True,
             )
 
-            masks = batch["mask"].to(
+            masks = batch[
+                "mask"
+            ].to(
                 device,
                 non_blocking=True,
             )
 
-            if scaler_enabled:
+            # ------------------------------------------------
+            # AMP inference
+            # ------------------------------------------------
+
+            if device.type == "cuda":
 
                 with torch.autocast(
                     device_type="cuda",
                     dtype=torch.float16,
                 ):
-                    logits = model(images)
+                    logits = model(
+                        images
+                    )
 
             else:
-                logits = model(images)
+                logits = model(
+                    images
+                )
 
             probabilities = torch.sigmoid(
-                logits
+                logits.float()
             )
 
             predictions = (
-                probabilities >= THRESHOLD
+                probabilities
+                >= args.threshold
             )
 
-            for i in range(images.size(0)):
+            images_np = (
+                predictions
+                .cpu()
+                .numpy()
+            )
 
-                metric = binary_metrics(
-                    predictions[i:i + 1],
-                    masks[i:i + 1],
+            masks_np = (
+                masks
+                .cpu()
+                .numpy()
+            )
+
+            probabilities_np = (
+                probabilities
+                .cpu()
+                .numpy()
+            )
+
+            for i in range(
+                len(images_np)
+            ):
+
+                prediction = (
+                    images_np[i, 0]
                 )
 
-                global_id = batch[
-                    "global_id"
-                ][i]
+                target = (
+                    masks_np[i, 0]
+                    > 0.5
+                )
 
-                dataset_name = batch[
-                    "dataset"
-                ][i]
+                probability = (
+                    probabilities_np[
+                        i, 0
+                    ]
+                )
+
+                metrics = (
+                    segmentation_metrics(
+                        prediction,
+                        target,
+                    )
+                )
+
+                global_id = str(
+                    batch[
+                        "global_id"
+                    ][i]
+                )
+
+                dataset_name = str(
+                    batch[
+                        "dataset"
+                    ][i]
+                )
+
+                predicted_area = int(
+                    prediction.sum()
+                )
+
+                target_area = int(
+                    target.sum()
+                )
+
+                max_probability = float(
+                    probability.max()
+                )
+
+                scene_positive = (
+                    predicted_area > 0
+                )
+
+                target_positive = (
+                    target_area > 0
+                )
 
                 record = {
                     "global_id": global_id,
                     "dataset": dataset_name,
-                    "dice": metric["dice"],
-                    "iou": metric["iou"],
-                    "precision": metric["precision"],
-                    "recall": metric["recall"],
-                    "f1": metric["f1"],
-                    "accuracy": metric["accuracy"],
-                    "tp": metric["tp"],
-                    "fp": metric["fp"],
-                    "fn": metric["fn"],
-                    "tn": metric["tn"],
+                    "tp": metrics["tp"],
+                    "fp": metrics["fp"],
+                    "fn": metrics["fn"],
+                    "tn": metrics["tn"],
+                    "dice": metrics["dice"],
+                    "iou": metrics["iou"],
+                    "precision": metrics[
+                        "precision"
+                    ],
+                    "recall": metrics[
+                        "recall"
+                    ],
+                    "f1": metrics["f1"],
+                    "accuracy": metrics[
+                        "accuracy"
+                    ],
                     "target_positive_pixels":
-                        metric[
-                            "target_positive_pixels"
-                        ],
+                        target_area,
                     "predicted_positive_pixels":
-                        metric[
-                            "predicted_positive_pixels"
-                        ],
+                        predicted_area,
+                    "max_probability":
+                        max_probability,
+                    "target_positive_scene":
+                        target_positive,
+                    "predicted_positive_scene":
+                        scene_positive,
                 }
 
-                per_sample.append(record)
+                per_sample.append(
+                    record
+                )
 
-            completed = min(
-                batch_index * BATCH_SIZE,
-                len(dataset),
-            )
+                total_tp += metrics[
+                    "tp"
+                ]
 
-            print(
-                f"[{completed:3d}/{len(dataset)}] "
-                f"{100.0 * completed / len(dataset):6.2f}%"
-            )
+                total_fp += metrics[
+                    "fp"
+                ]
+
+                total_fn += metrics[
+                    "fn"
+                ]
+
+                total_tn += metrics[
+                    "tn"
+                ]
+
+                if dataset_name not in (
+                    dataset_accumulator
+                ):
+                    dataset_accumulator[
+                        dataset_name
+                    ] = []
+
+                dataset_accumulator[
+                    dataset_name
+                ].append(
+                    record
+                )
+
+                processed += 1
+
+            if (
+                processed == 1
+                or processed % 25 == 0
+                or processed == len(df)
+            ):
+                print(
+                    f"Processed: "
+                    f"{processed}/{len(df)}"
+                )
 
     # --------------------------------------------------------
-    # Save per-sample results
+    # OVERALL MICRO
     # --------------------------------------------------------
 
-    results_df = pd.DataFrame(
+    micro_dice = safe_divide(
+        2 * total_tp,
+        2 * total_tp
+        + total_fp
+        + total_fn,
+    )
+
+    micro_iou = safe_divide(
+        total_tp,
+        total_tp
+        + total_fp
+        + total_fn,
+    )
+
+    micro_precision = safe_divide(
+        total_tp,
+        total_tp + total_fp,
+    )
+
+    micro_recall = safe_divide(
+        total_tp,
+        total_tp + total_fn,
+    )
+
+    micro_f1 = safe_divide(
+        2
+        * micro_precision
+        * micro_recall,
+        micro_precision
+        + micro_recall,
+    )
+
+    micro_accuracy = safe_divide(
+        total_tp + total_tn,
+        total_tp
+        + total_tn
+        + total_fp
+        + total_fn,
+    )
+
+    # --------------------------------------------------------
+    # MACRO
+    # --------------------------------------------------------
+
+    sample_df = pd.DataFrame(
         per_sample
     )
 
-    results_df.to_csv(
-        RESULTS_CSV,
-        index=False,
-    )
+    macro_metrics = {
+        metric: float(
+            sample_df[metric].mean()
+        )
+        for metric in [
+            "dice",
+            "iou",
+            "precision",
+            "recall",
+            "f1",
+            "accuracy",
+        ]
+    }
 
     # --------------------------------------------------------
-    # Aggregate metrics
+    # DATASET METRICS
     # --------------------------------------------------------
-
-    overall = aggregate_counts(
-        per_sample
-    )
 
     by_dataset = {}
 
-    for dataset_name in [
-        "oil",
-        "lookalike",
-        "no_oil",
-    ]:
+    for dataset_name, rows in (
+        dataset_accumulator.items()
+    ):
 
-        subset = [
-            r for r in per_sample
-            if r["dataset"] == dataset_name
-        ]
+        ddf = pd.DataFrame(rows)
 
-        by_dataset[dataset_name] = (
-            aggregate_counts(subset)
+        tp = int(
+            ddf["tp"].sum()
         )
 
-    # Macro average of per-image metrics.
-    macro = {
-        "dice": float(
-            results_df["dice"].mean()
-        ),
-        "iou": float(
-            results_df["iou"].mean()
-        ),
-        "precision": float(
-            results_df["precision"].mean()
-        ),
-        "recall": float(
-            results_df["recall"].mean()
-        ),
-        "f1": float(
-            results_df["f1"].mean()
-        ),
-        "accuracy": float(
-            results_df["accuracy"].mean()
-        ),
-    }
+        fp = int(
+            ddf["fp"].sum()
+        )
+
+        fn = int(
+            ddf["fn"].sum()
+        )
+
+        tn = int(
+            ddf["tn"].sum()
+        )
+
+        dice = safe_divide(
+            2 * tp,
+            2 * tp + fp + fn,
+        )
+
+        iou = safe_divide(
+            tp,
+            tp + fp + fn,
+        )
+
+        precision = safe_divide(
+            tp,
+            tp + fp,
+        )
+
+        recall = safe_divide(
+            tp,
+            tp + fn,
+        )
+
+        f1 = safe_divide(
+            2 * precision * recall,
+            precision + recall,
+        )
+
+        accuracy = safe_divide(
+            tp + tn,
+            tp + tn + fp + fn,
+        )
+
+        by_dataset[
+            dataset_name
+        ] = {
+            "samples": len(ddf),
+            "tp": tp,
+            "fp": fp,
+            "fn": fn,
+            "tn": tn,
+            "dice": dice,
+            "iou": iou,
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "accuracy": accuracy,
+            "target_positive_pixels":
+                int(
+                    ddf[
+                        "target_positive_pixels"
+                    ].sum()
+                ),
+            "predicted_positive_pixels":
+                int(
+                    ddf[
+                        "predicted_positive_pixels"
+                    ].sum()
+                ),
+        }
 
     # --------------------------------------------------------
-    # Oil-scene detection summary
+    # SCENE LEVEL
     # --------------------------------------------------------
 
-    oil_df = results_df[
-        results_df["dataset"] == "oil"
+    oil_df = sample_df[
+        sample_df["dataset"] == "oil"
     ]
 
-    lookalike_df = results_df[
-        results_df["dataset"] == "lookalike"
+    lookalike_df = sample_df[
+        sample_df["dataset"]
+        == "lookalike"
     ]
 
-    no_oil_df = results_df[
-        results_df["dataset"] == "no_oil"
+    no_oil_df = sample_df[
+        sample_df["dataset"]
+        == "no_oil"
     ]
 
-    oil_target_positive = (
-        oil_df["target_positive_pixels"] > 0
+    oil_detection_rate = safe_divide(
+        int(
+            oil_df[
+                "predicted_positive_scene"
+            ].sum()
+        ),
+        len(oil_df),
     )
 
-    oil_prediction_positive = (
-        oil_df["predicted_positive_pixels"] > 0
-    )
-
-    oil_scene_detection = {
-        "oil_samples": int(len(oil_df)),
-        "oil_samples_predicted_positive":
-            int(oil_prediction_positive.sum()),
-        "oil_samples_predicted_empty":
-            int((~oil_prediction_positive).sum()),
-    }
-
-    # For negative classes, any predicted positive pixel
-    # is a scene-level false alarm.
-    lookalike_false_alarm_rate = float(
-        (
+    lookalike_false_alarm_rate = safe_divide(
+        int(
             lookalike_df[
-                "predicted_positive_pixels"
-            ] > 0
-        ).mean()
-    )
-
-    no_oil_false_alarm_rate = float(
-        (
-            no_oil_df[
-                "predicted_positive_pixels"
-            ] > 0
-        ).mean()
-    )
-
-    scene_summary = {
-        "oil_detection_rate": float(
-            oil_prediction_positive.mean()
+                "predicted_positive_scene"
+            ].sum()
         ),
-        "lookalike_false_alarm_rate":
-            lookalike_false_alarm_rate,
-        "no_oil_false_alarm_rate":
-            no_oil_false_alarm_rate,
-    }
+        len(lookalike_df),
+    )
+
+    no_oil_false_alarm_rate = safe_divide(
+        int(
+            no_oil_df[
+                "predicted_positive_scene"
+            ].sum()
+        ),
+        len(no_oil_df),
+    )
 
     # --------------------------------------------------------
-    # Summary
+    # SUMMARY
     # --------------------------------------------------------
 
     summary = {
-        "experiment": "oil-seg-v1",
-        "checkpoint": str(CHECKPOINT),
-        "test_manifest": str(TEST_MANIFEST),
-        "test_samples": len(test_df),
-        "threshold": THRESHOLD,
+        "experiment": args.experiment,
+        "checkpoint": str(
+            args.checkpoint
+        ),
+        "test_manifest": str(
+            args.test_manifest
+        ),
+        "test_samples": len(df),
+        "threshold": args.threshold,
         "device": str(device),
         "gpu": (
             torch.cuda.get_device_name(0)
             if device.type == "cuda"
-            else None
+            else "CPU"
         ),
         "architecture": "U-Net",
         "encoder": "ResNet34",
         "in_channels": 2,
         "classes": 1,
         "image_size": 512,
-        "overall_micro": overall,
-        "overall_macro": macro,
+        "overall_micro": {
+            "samples": len(df),
+            "tp": total_tp,
+            "fp": total_fp,
+            "fn": total_fn,
+            "tn": total_tn,
+            "dice": micro_dice,
+            "iou": micro_iou,
+            "precision": micro_precision,
+            "recall": micro_recall,
+            "f1": micro_f1,
+            "accuracy": micro_accuracy,
+            "target_positive_pixels": int(
+                sample_df[
+                    "target_positive_pixels"
+                ].sum()
+            ),
+            "predicted_positive_pixels":
+                int(
+                    sample_df[
+                        "predicted_positive_pixels"
+                    ].sum()
+                ),
+        },
+        "overall_macro": macro_metrics,
         "by_dataset": by_dataset,
-        "scene_level": scene_summary,
-        "oil_scene_detection": oil_scene_detection,
+        "scene_level": {
+            "oil_detection_rate":
+                oil_detection_rate,
+            "lookalike_false_alarm_rate":
+                lookalike_false_alarm_rate,
+            "no_oil_false_alarm_rate":
+                no_oil_false_alarm_rate,
+        },
+        "oil_scene_detection": {
+            "oil_samples": len(oil_df),
+            "oil_samples_predicted_positive":
+                int(
+                    oil_df[
+                        "predicted_positive_scene"
+                    ].sum()
+                ),
+            "oil_samples_predicted_empty":
+                int(
+                    (
+                        ~oil_df[
+                            "predicted_positive_scene"
+                        ]
+                    ).sum()
+                ),
+        },
     }
 
-    with open(
-        SUMMARY_JSON,
+    # --------------------------------------------------------
+    # OUTPUT
+    # --------------------------------------------------------
+
+    output_dir = (
+        DRIVE_ROOT
+        / "evaluation"
+        / args.experiment
+    )
+
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    csv_path = (
+        output_dir
+        / "test_predictions.csv"
+    )
+
+    json_path = (
+        output_dir
+        / "test_summary.json"
+    )
+
+    sample_df.to_csv(
+        csv_path,
+        index=False,
+    )
+
+    with json_path.open(
         "w",
         encoding="utf-8",
     ) as f:
-
         json.dump(
             summary,
             f,
@@ -736,114 +969,97 @@ def main():
         )
 
     # --------------------------------------------------------
-    # Final report
+    # PRINT RESULTS
     # --------------------------------------------------------
 
     print()
     print("=" * 70)
-    print("FINAL TEST RESULTS")
+    print("V2 TEST RESULTS")
     print("=" * 70)
 
     print()
-    print("MICRO-AGGREGATED PIXEL METRICS")
     print(
-        f"Dice      : {overall['dice']:.4f}"
-    )
-    print(
-        f"IoU       : {overall['iou']:.4f}"
-    )
-    print(
-        f"Precision : {overall['precision']:.4f}"
-    )
-    print(
-        f"Recall    : {overall['recall']:.4f}"
-    )
-    print(
-        f"F1        : {overall['f1']:.4f}"
-    )
-    print(
-        f"Accuracy  : {overall['accuracy']:.4f}"
+        "Overall micro Dice :",
+        f"{micro_dice:.6f}",
     )
 
-    print()
-    print("MACRO-AVERAGED PER-SAMPLE METRICS")
     print(
-        f"Dice      : {macro['dice']:.4f}"
+        "Overall micro IoU  :",
+        f"{micro_iou:.6f}",
     )
+
     print(
-        f"IoU       : {macro['iou']:.4f}"
+        "Precision           :",
+        f"{micro_precision:.6f}",
     )
+
     print(
-        f"Precision : {macro['precision']:.4f}"
-    )
-    print(
-        f"Recall    : {macro['recall']:.4f}"
-    )
-    print(
-        f"F1        : {macro['f1']:.4f}"
+        "Recall              :",
+        f"{micro_recall:.6f}",
     )
 
     print()
     print("BY DATASET")
 
-    for name, metrics in by_dataset.items():
+    for name, metrics in (
+        by_dataset.items()
+    ):
 
         print()
         print(
-            f"{name.upper():12s} "
-            f"({metrics['samples']} samples)"
+            name.upper()
         )
 
         print(
-            f"  Dice      : {metrics['dice']:.4f}"
+            "  Dice      :",
+            f"{metrics['dice']:.6f}",
         )
+
         print(
-            f"  IoU       : {metrics['iou']:.4f}"
+            "  IoU       :",
+            f"{metrics['iou']:.6f}",
         )
+
         print(
-            f"  Precision : {metrics['precision']:.4f}"
+            "  Precision :",
+            f"{metrics['precision']:.6f}",
         )
+
         print(
-            f"  Recall    : {metrics['recall']:.4f}"
+            "  Recall    :",
+            f"{metrics['recall']:.6f}",
         )
 
     print()
-    print("SCENE-LEVEL SIGNAL")
+    print("SCENE LEVEL")
 
     print(
-        "Oil detection rate       : "
-        f"{scene_summary['oil_detection_rate']:.4f}"
+        "  Oil detection:",
+        f"{oil_detection_rate:.2%}",
     )
 
     print(
-        "Lookalike false alarm    : "
-        f"{scene_summary['lookalike_false_alarm_rate']:.4f}"
+        "  Lookalike false alarm:",
+        f"{lookalike_false_alarm_rate:.2%}",
     )
 
     print(
-        "No-oil false alarm       : "
-        f"{scene_summary['no_oil_false_alarm_rate']:.4f}"
+        "  No-oil false alarm:",
+        f"{no_oil_false_alarm_rate:.2%}",
     )
+
+    print()
+    print("CSV:")
+    print(csv_path)
+
+    print()
+    print("JSON:")
+    print(json_path)
 
     print()
     print("=" * 70)
-    print("EVALUATION COMPLETE")
+    print("TEST EVALUATION COMPLETE")
     print("=" * 70)
-
-    print()
-    print("Per-sample CSV:")
-    print(RESULTS_CSV)
-
-    print()
-    print("Summary JSON:")
-    print(SUMMARY_JSON)
-
-    print()
-    print(
-        "IMPORTANT: "
-        "The test set was evaluated exactly once "
-        "with the frozen best checkpoint."
-    )
 
 
 if __name__ == "__main__":
