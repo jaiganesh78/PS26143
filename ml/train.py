@@ -1,85 +1,196 @@
+from __future__ import annotations
 
-from pathlib import Path
 import csv
 import os
 import random
 import time
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
+import yaml
 from torch.utils.data import DataLoader
 
 from src.datasets.oil_dataset import OilSegmentationDataset
 from src.models.segmentation_model import build_model
-from src.training.losses import BCEDiceLoss
+from src.training.losses import V2SegmentationLoss
 
 
 # ============================================================
-# PS26143 — RESUMABLE BASELINE SEGMENTATION TRAINING
+# PS26143 — V2 SEGMENTATION TRAINING
 # ============================================================
-
-SEED = 42
 
 REPO = Path("/content/PS26143")
 DRIVE_ROOT = Path("/content/drive/MyDrive/PS26143")
 
+CONFIG_FILE = REPO / "ml/configs/train_baseline.yaml"
+
 PROCESSED_ROOT = DRIVE_ROOT / "data/processed"
 
-TRAIN_MANIFEST = PROCESSED_ROOT / "train/manifest.csv"
-VAL_MANIFEST = PROCESSED_ROOT / "val/manifest.csv"
+TRAIN_MANIFEST = (
+    PROCESSED_ROOT / "train/manifest.csv"
+)
+
+VAL_MANIFEST = (
+    PROCESSED_ROOT / "val/manifest.csv"
+)
 
 CHECKPOINT_DIR = DRIVE_ROOT / "checkpoints"
 LOG_DIR = DRIVE_ROOT / "logs"
 
-CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-LOG_DIR.mkdir(parents=True, exist_ok=True)
+CHECKPOINT_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+LOG_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
 
 
 # ============================================================
-# CONFIG
+# CONFIGURATION
 # ============================================================
 
-IMAGE_SIZE = 512
+def load_config():
+    if not CONFIG_FILE.exists():
+        raise FileNotFoundError(
+            f"Configuration file missing: {CONFIG_FILE}"
+        )
 
-BATCH_SIZE = 16
-EPOCHS = 50
+    with CONFIG_FILE.open(
+        "r",
+        encoding="utf-8",
+    ) as f:
+        config = yaml.safe_load(f)
 
-LEARNING_RATE = 1e-4
-WEIGHT_DECAY = 1e-4
+    return config
 
-BCE_WEIGHT = 0.5
-DICE_WEIGHT = 0.5
 
-LR_PATIENCE = 3
-EARLY_STOPPING_PATIENCE = 5
+CONFIG = load_config()
 
-NUM_WORKERS = 2
+EXPERIMENT_NAME = CONFIG["name"]
 
-THRESHOLD = 0.5
+SEED = int(CONFIG["seed"])
 
-# IMPORTANT:
-# Automatically continue from the last checkpoint if one exists.
-RESUME = True
+IMAGE_SIZE = int(
+    CONFIG["data"]["image_size"]
+)
+
+BATCH_SIZE = int(
+    CONFIG["training"]["batch_size"]
+)
+
+EPOCHS = int(
+    CONFIG["training"]["epochs"]
+)
+
+LEARNING_RATE = float(
+    CONFIG["training"]["learning_rate"]
+)
+
+WEIGHT_DECAY = float(
+    CONFIG["training"]["weight_decay"]
+)
+
+MIXED_PRECISION = bool(
+    CONFIG["training"].get(
+        "mixed_precision",
+        True,
+    )
+)
+
+NUM_WORKERS = int(
+    CONFIG["training"].get(
+        "num_workers",
+        2,
+    )
+)
+
+THRESHOLD = float(
+    CONFIG["evaluation"]["threshold"]
+)
+
+LR_PATIENCE = int(
+    CONFIG["scheduler"]["patience"]
+)
+
+LR_FACTOR = float(
+    CONFIG["scheduler"]["factor"]
+)
+
+MIN_LR = float(
+    CONFIG["scheduler"].get(
+        "min_lr",
+        0.0,
+    )
+)
+
+EARLY_STOPPING_PATIENCE = int(
+    CONFIG["early_stopping"]["patience"]
+)
+
+FOCAL_WEIGHT = float(
+    CONFIG["loss"]["focal_weight"]
+)
+
+DICE_WEIGHT = float(
+    CONFIG["loss"]["dice_weight"]
+)
+
+BOUNDARY_WEIGHT = float(
+    CONFIG["loss"]["boundary_weight"]
+)
+
+NEGATIVE_WEIGHT = float(
+    CONFIG["loss"]["negative_weight"]
+)
+
+FOCAL_ALPHA = float(
+    CONFIG["loss"]["focal_alpha"]
+)
+
+FOCAL_GAMMA = float(
+    CONFIG["loss"]["focal_gamma"]
+)
+
+NEGATIVE_THRESHOLD = float(
+    CONFIG["loss"]["negative_threshold"]
+)
 
 
 # ============================================================
-# CHECKPOINT PATHS
+# V2 CHECKPOINTS
 # ============================================================
 
-BEST_CHECKPOINT = CHECKPOINT_DIR / "oil_seg_v1_best.pt"
-LAST_CHECKPOINT = CHECKPOINT_DIR / "oil_seg_v1_last.pt"
+BEST_CHECKPOINT = (
+    CHECKPOINT_DIR
+    / "oil_seg_v2_best.pt"
+)
 
-LOG_FILE = LOG_DIR / "oil_seg_v1_training.csv"
+LAST_CHECKPOINT = (
+    CHECKPOINT_DIR
+    / "oil_seg_v2_last.pt"
+)
+
+LOG_FILE = (
+    LOG_DIR
+    / "oil_seg_v2_training.csv"
+)
 
 
 # ============================================================
 # REPRODUCIBILITY
 # ============================================================
 
-def seed_everything(seed):
+def seed_everything(seed: int):
+
     random.seed(seed)
+
     np.random.seed(seed)
+
     torch.manual_seed(seed)
 
     if torch.cuda.is_available():
@@ -93,19 +204,31 @@ def seed_everything(seed):
 # METRICS
 # ============================================================
 
-def dice_score(logits, targets, threshold=0.5, smooth=1.0):
+def dice_score(
+    logits,
+    targets,
+    threshold=0.5,
+    smooth=1.0,
+):
     probabilities = torch.sigmoid(logits)
-    predictions = (probabilities >= threshold).float()
+
+    predictions = (
+        probabilities >= threshold
+    ).float()
 
     predictions = predictions.contiguous().view(
-        predictions.size(0), -1
+        predictions.size(0),
+        -1,
     )
 
     targets = targets.contiguous().view(
-        targets.size(0), -1
+        targets.size(0),
+        -1,
     )
 
-    intersection = (predictions * targets).sum(dim=1)
+    intersection = (
+        predictions * targets
+    ).sum(dim=1)
 
     dice = (
         2.0 * intersection + smooth
@@ -118,19 +241,31 @@ def dice_score(logits, targets, threshold=0.5, smooth=1.0):
     return dice.mean().item()
 
 
-def iou_score(logits, targets, threshold=0.5, smooth=1.0):
+def iou_score(
+    logits,
+    targets,
+    threshold=0.5,
+    smooth=1.0,
+):
     probabilities = torch.sigmoid(logits)
-    predictions = (probabilities >= threshold).float()
+
+    predictions = (
+        probabilities >= threshold
+    ).float()
 
     predictions = predictions.contiguous().view(
-        predictions.size(0), -1
+        predictions.size(0),
+        -1,
     )
 
     targets = targets.contiguous().view(
-        targets.size(0), -1
+        targets.size(0),
+        -1,
     )
 
-    intersection = (predictions * targets).sum(dim=1)
+    intersection = (
+        predictions * targets
+    ).sum(dim=1)
 
     union = (
         predictions.sum(dim=1)
@@ -138,7 +273,11 @@ def iou_score(logits, targets, threshold=0.5, smooth=1.0):
         - intersection
     )
 
-    iou = (intersection + smooth) / (union + smooth)
+    iou = (
+        intersection + smooth
+    ) / (
+        union + smooth
+    )
 
     return iou.mean().item()
 
@@ -147,7 +286,13 @@ def iou_score(logits, targets, threshold=0.5, smooth=1.0):
 # DATA
 # ============================================================
 
-def load_records(path):
+def load_records(path: Path):
+
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Manifest missing: {path}"
+        )
+
     df = pd.read_csv(path)
 
     required = {
@@ -159,16 +304,60 @@ def load_records(path):
         "mask",
     }
 
-    missing = required - set(df.columns)
+    missing = required - set(
+        df.columns
+    )
 
     if missing:
         raise ValueError(
-            f"Manifest missing columns: {sorted(missing)}"
+            f"Manifest {path} missing columns: "
+            f"{sorted(missing)}"
         )
 
-    records = df.to_dict("records")
+    records = df.to_dict(
+        "records"
+    )
 
     return records
+
+
+def verify_records(
+    records,
+    expected_split,
+    expected_count,
+):
+    if len(records) != expected_count:
+        raise ValueError(
+            f"{expected_split}: expected "
+            f"{expected_count} records, got "
+            f"{len(records)}"
+        )
+
+    for record in records:
+
+        if record["split"] != expected_split:
+            raise ValueError(
+                f"Manifest split mismatch: "
+                f"{record['global_id']}"
+            )
+
+        image = Path(
+            record["image"]
+        )
+
+        mask = Path(
+            record["mask"]
+        )
+
+        if not image.exists():
+            raise FileNotFoundError(
+                f"Missing image: {image}"
+            )
+
+        if not mask.exists():
+            raise FileNotFoundError(
+                f"Missing mask: {mask}"
+            )
 
 
 # ============================================================
@@ -184,6 +373,7 @@ def train_one_epoch(
     device,
     epoch,
 ):
+
     model.train()
 
     running_loss = 0.0
@@ -192,7 +382,10 @@ def train_one_epoch(
 
     total = len(loader)
 
-    for step, batch in enumerate(loader, start=1):
+    for step, batch in enumerate(
+        loader,
+        start=1,
+    ):
 
         images = batch["image"].to(
             device,
@@ -204,13 +397,19 @@ def train_one_epoch(
             non_blocking=True,
         )
 
-        optimizer.zero_grad(set_to_none=True)
+        optimizer.zero_grad(
+            set_to_none=True
+        )
 
         with torch.autocast(
             device_type=device.type,
             dtype=torch.float16,
-            enabled=device.type == "cuda",
+            enabled=(
+                MIXED_PRECISION
+                and device.type == "cuda"
+            ),
         ):
+
             logits = model(images)
 
             loss = criterion(
@@ -220,9 +419,13 @@ def train_one_epoch(
 
         if scaler.is_enabled():
 
-            scaler.scale(loss).backward()
+            scaler.scale(
+                loss
+            ).backward()
 
-            scaler.step(optimizer)
+            scaler.step(
+                optimizer
+            )
 
             scaler.update()
 
@@ -232,7 +435,9 @@ def train_one_epoch(
 
             optimizer.step()
 
-        running_loss += loss.item()
+        running_loss += (
+            loss.item()
+        )
 
         running_dice += dice_score(
             logits.detach(),
@@ -251,9 +456,12 @@ def train_one_epoch(
             or step % 10 == 0
             or step == total
         ):
+
             print(
-                f"    batch {step:3d}/{total} "
-                f"| loss {loss.item():.4f}",
+                f"    batch "
+                f"{step:3d}/{total} "
+                f"| loss "
+                f"{loss.item():.5f}",
                 flush=True,
             )
 
@@ -275,6 +483,7 @@ def validate(
     criterion,
     device,
 ):
+
     model.eval()
 
     running_loss = 0.0
@@ -298,8 +507,12 @@ def validate(
         with torch.autocast(
             device_type=device.type,
             dtype=torch.float16,
-            enabled=device.type == "cuda",
+            enabled=(
+                MIXED_PRECISION
+                and device.type == "cuda"
+            ),
         ):
+
             logits = model(images)
 
             loss = criterion(
@@ -307,7 +520,9 @@ def validate(
                 masks,
             )
 
-        running_loss += loss.item()
+        running_loss += (
+            loss.item()
+        )
 
         running_dice += dice_score(
             logits,
@@ -341,84 +556,124 @@ def checkpoint_payload(
     best_val_dice,
     epochs_without_improvement,
 ):
+
     return {
-        "epoch": epoch,
 
-        "model_state_dict": model.state_dict(),
+        "experiment":
+            EXPERIMENT_NAME,
 
-        "optimizer_state_dict": optimizer.state_dict(),
+        "version":
+            "v2",
 
-        "scheduler_state_dict": scheduler.state_dict(),
+        "epoch":
+            epoch,
 
-        "scaler_state_dict": scaler.state_dict(),
+        "model_state_dict":
+            model.state_dict(),
 
-        "best_val_dice": best_val_dice,
+        "optimizer_state_dict":
+            optimizer.state_dict(),
+
+        "scheduler_state_dict":
+            scheduler.state_dict(),
+
+        "scaler_state_dict":
+            scaler.state_dict(),
+
+        "best_val_dice":
+            best_val_dice,
 
         "epochs_without_improvement":
             epochs_without_improvement,
 
-        "seed": SEED,
+        "seed":
+            SEED,
 
-        "architecture": "unet",
+        "architecture":
+            CONFIG["model"]["architecture"],
 
-        "encoder": "resnet34",
+        "encoder":
+            CONFIG["model"]["encoder"],
 
-        "encoder_weights": "imagenet",
+        "encoder_weights":
+            CONFIG["model"]["encoder_weights"],
 
-        "in_channels": 2,
+        "in_channels":
+            CONFIG["model"]["in_channels"],
 
-        "classes": 1,
+        "classes":
+            CONFIG["model"]["classes"],
 
-        "image_size": IMAGE_SIZE,
+        "image_size":
+            IMAGE_SIZE,
 
-        "batch_size": BATCH_SIZE,
+        "batch_size":
+            BATCH_SIZE,
 
-        "learning_rate": LEARNING_RATE,
+        "learning_rate":
+            LEARNING_RATE,
 
-        "weight_decay": WEIGHT_DECAY,
+        "weight_decay":
+            WEIGHT_DECAY,
 
-        "threshold": THRESHOLD,
+        "loss_config":
+            CONFIG["loss"],
 
-        "python_version": os.sys.version,
+        "scheduler_config":
+            CONFIG["scheduler"],
 
-        "torch_version": torch.__version__,
+        "threshold":
+            THRESHOLD,
 
-        "cuda_device": (
-            torch.cuda.get_device_name(0)
-            if torch.cuda.is_available()
-            else "cpu"
-        ),
+        "python_version":
+            os.sys.version,
 
-        "python_random_state": random.getstate(),
+        "torch_version":
+            torch.__version__,
 
-        "numpy_random_state": np.random.get_state(),
+        "cuda_device":
+            (
+                torch.cuda.get_device_name(0)
+                if torch.cuda.is_available()
+                else "cpu"
+            ),
 
-        "torch_random_state": torch.get_rng_state(),
+        "python_random_state":
+            random.getstate(),
 
-        "torch_cuda_random_state": (
-            torch.cuda.get_rng_state_all()
-            if torch.cuda.is_available()
-            else None
-        ),
+        "numpy_random_state":
+            np.random.get_state(),
+
+        "torch_random_state":
+            torch.get_rng_state(),
+
+        "torch_cuda_random_state":
+            (
+                torch.cuda.get_rng_state_all()
+                if torch.cuda.is_available()
+                else None
+            ),
     }
 
 
-def atomic_torch_save(payload, path):
-    """
-    Save checkpoint to a temporary file first,
-    then atomically replace the destination.
-
-    This reduces the risk of leaving a corrupt checkpoint
-    if the runtime dies while writing.
-    """
+def atomic_torch_save(
+    payload,
+    path: Path,
+):
 
     temporary = path.with_suffix(
         path.suffix + ".tmp"
     )
 
-    torch.save(payload, temporary)
+    torch.save(
+        payload,
+        temporary,
+    )
 
-    os.replace(temporary, path)
+    os.replace(
+        temporary,
+        path,
+    )
 
 
 def save_checkpoint(
@@ -431,6 +686,7 @@ def save_checkpoint(
     best_val_dice,
     epochs_without_improvement,
 ):
+
     payload = checkpoint_payload(
         model=model,
         optimizer=optimizer,
@@ -460,9 +716,10 @@ def restore_checkpoint(
     scaler,
     device,
 ):
+
     print()
     print("=" * 70)
-    print("RESUMING FROM CHECKPOINT")
+    print("RESUMING V2 TRAINING")
     print("=" * 70)
 
     checkpoint = torch.load(
@@ -470,6 +727,16 @@ def restore_checkpoint(
         map_location=device,
         weights_only=False,
     )
+
+    if checkpoint.get(
+        "version"
+    ) != "v2":
+
+        raise RuntimeError(
+            "The existing checkpoint is not a V2 "
+            "checkpoint. Refusing to resume from "
+            "another experiment."
+        )
 
     model.load_state_dict(
         checkpoint["model_state_dict"]
@@ -488,30 +755,38 @@ def restore_checkpoint(
             checkpoint["scaler_state_dict"]
         )
 
-    # Restore RNG states where available.
     if "python_random_state" in checkpoint:
         random.setstate(
-            checkpoint["python_random_state"]
+            checkpoint[
+                "python_random_state"
+            ]
         )
 
     if "numpy_random_state" in checkpoint:
         np.random.set_state(
-            checkpoint["numpy_random_state"]
+            checkpoint[
+                "numpy_random_state"
+            ]
         )
 
     if "torch_random_state" in checkpoint:
         torch.set_rng_state(
-            checkpoint["torch_random_state"]
+            checkpoint[
+                "torch_random_state"
+            ]
         )
+
+    cuda_state = checkpoint.get(
+        "torch_cuda_random_state"
+    )
 
     if (
         torch.cuda.is_available()
-        and checkpoint.get(
-            "torch_cuda_random_state"
-        ) is not None
+        and cuda_state is not None
     ):
+
         torch.cuda.set_rng_state_all(
-            checkpoint["torch_cuda_random_state"]
+            cuda_state
         )
 
     previous_epoch = int(
@@ -529,39 +804,32 @@ def restore_checkpoint(
         )
     )
 
-    start_epoch = previous_epoch + 1
-
     print(
-        "Checkpoint epoch        :",
+        "Checkpoint epoch      :",
         previous_epoch,
     )
 
     print(
-        "Starting epoch          :",
-        start_epoch,
+        "Starting epoch        :",
+        previous_epoch + 1,
     )
 
     print(
-        "Best validation Dice    :",
-        f"{best_val_dice:.5f}",
+        "Best validation Dice  :",
+        f"{best_val_dice:.6f}",
     )
 
     print(
-        "No-improvement epochs   :",
-        epochs_without_improvement,
-    )
-
-    print(
-        "Checkpoint              :",
+        "Checkpoint            :",
         path,
     )
 
     print(
-        "RESUME SUCCESSFUL"
+        "V2 RESUME SUCCESSFUL"
     )
 
     return (
-        start_epoch,
+        previous_epoch + 1,
         best_val_dice,
         epochs_without_improvement,
     )
@@ -585,11 +853,11 @@ LOG_COLUMNS = [
 
 
 def prepare_log_file(resuming):
-    """
-    Do not erase the training history when resuming.
-    """
 
-    if resuming and LOG_FILE.exists():
+    if (
+        resuming
+        and LOG_FILE.exists()
+    ):
         return
 
     with LOG_FILE.open(
@@ -616,6 +884,7 @@ def append_log(
     learning_rate,
     epoch_seconds,
 ):
+
     with LOG_FILE.open(
         "a",
         newline="",
@@ -648,40 +917,37 @@ def main():
     seed_everything(SEED)
 
     print("=" * 70)
-    print("PS26143 — BASELINE SEGMENTATION TRAINING")
+    print("PS26143 — V2 SEGMENTATION TRAINING")
     print("=" * 70)
 
     print()
-    print("PyTorch :", torch.__version__)
-    print("CUDA    :", torch.cuda.is_available())
+    print("Experiment :", EXPERIMENT_NAME)
+    print("PyTorch    :", torch.__version__)
+    print("CUDA       :", torch.cuda.is_available())
 
-    if torch.cuda.is_available():
+    if not torch.cuda.is_available():
 
-        device = torch.device("cuda")
-
-        print(
-            "GPU     :",
-            torch.cuda.get_device_name(0),
+        raise RuntimeError(
+            "CUDA GPU is required for the real V2 run."
         )
 
-        print(
-            "VRAM    :",
-            round(
-                torch.cuda.get_device_properties(0)
-                .total_memory
-                / (1024 ** 3),
-                2,
-            ),
-            "GiB",
-        )
+    device = torch.device("cuda")
 
-    else:
+    print(
+        "GPU        :",
+        torch.cuda.get_device_name(0),
+    )
 
-        device = torch.device("cpu")
-
-        print(
-            "WARNING: CUDA unavailable."
-        )
+    print(
+        "VRAM       :",
+        round(
+            torch.cuda.get_device_properties(0)
+            .total_memory
+            / (1024 ** 3),
+            2,
+        ),
+        "GiB",
+    )
 
     print()
     print(
@@ -699,17 +965,9 @@ def main():
         VAL_MANIFEST,
     )
 
-    if not TRAIN_MANIFEST.exists():
-        raise FileNotFoundError(
-            f"Training manifest missing: "
-            f"{TRAIN_MANIFEST}"
-        )
-
-    if not VAL_MANIFEST.exists():
-        raise FileNotFoundError(
-            f"Validation manifest missing: "
-            f"{VAL_MANIFEST}"
-        )
+    # --------------------------------------------------------
+    # LOAD DATA
+    # --------------------------------------------------------
 
     train_records = load_records(
         TRAIN_MANIFEST
@@ -717,6 +975,18 @@ def main():
 
     val_records = load_records(
         VAL_MANIFEST
+    )
+
+    verify_records(
+        train_records,
+        "train",
+        630,
+    )
+
+    verify_records(
+        val_records,
+        "val",
+        135,
     )
 
     print()
@@ -729,18 +999,6 @@ def main():
         "Validation samples:",
         len(val_records),
     )
-
-    if len(train_records) != 630:
-        raise ValueError(
-            f"Expected 630 training samples, "
-            f"found {len(train_records)}"
-        )
-
-    if len(val_records) != 135:
-        raise ValueError(
-            f"Expected 135 validation samples, "
-            f"found {len(val_records)}"
-        )
 
     # --------------------------------------------------------
     # DATASETS
@@ -761,8 +1019,10 @@ def main():
         batch_size=BATCH_SIZE,
         shuffle=True,
         num_workers=NUM_WORKERS,
-        pin_memory=device.type == "cuda",
-        persistent_workers=NUM_WORKERS > 0,
+        pin_memory=True,
+        persistent_workers=(
+            NUM_WORKERS > 0
+        ),
         drop_last=False,
     )
 
@@ -771,8 +1031,10 @@ def main():
         batch_size=BATCH_SIZE,
         shuffle=False,
         num_workers=NUM_WORKERS,
-        pin_memory=device.type == "cuda",
-        persistent_workers=NUM_WORKERS > 0,
+        pin_memory=True,
+        persistent_workers=(
+            NUM_WORKERS > 0
+        ),
         drop_last=False,
     )
 
@@ -782,15 +1044,20 @@ def main():
 
     print()
     print("=" * 70)
-    print("BUILDING MODEL")
+    print("BUILDING V2 MODEL")
     print("=" * 70)
 
     model = build_model(
-        architecture="unet",
-        encoder="resnet34",
-        encoder_weights="imagenet",
-        in_channels=2,
-        classes=1,
+        architecture=
+            CONFIG["model"]["architecture"],
+        encoder=
+            CONFIG["model"]["encoder"],
+        encoder_weights=
+            CONFIG["model"]["encoder_weights"],
+        in_channels=
+            CONFIG["model"]["in_channels"],
+        classes=
+            CONFIG["model"]["classes"],
     )
 
     model = model.to(device)
@@ -801,19 +1068,25 @@ def main():
     )
 
     print(
-        "Architecture : U-Net"
+        "Architecture :",
+        CONFIG["model"]["architecture"],
     )
 
     print(
-        "Encoder      : ResNet34"
+        "Encoder      :",
+        CONFIG["model"]["encoder"],
     )
 
     print(
-        "Input        : 2 channels"
+        "Input        :",
+        CONFIG["model"]["in_channels"],
+        "channels",
     )
 
     print(
-        "Output       : 1 channel"
+        "Output       :",
+        CONFIG["model"]["classes"],
+        "channel",
     )
 
     print(
@@ -822,12 +1095,58 @@ def main():
     )
 
     # --------------------------------------------------------
-    # LOSS
+    # V2 LOSS
     # --------------------------------------------------------
 
-    criterion = BCEDiceLoss(
-        bce_weight=BCE_WEIGHT,
+    print()
+    print("=" * 70)
+    print("V2 LOSS")
+    print("=" * 70)
+
+    criterion = V2SegmentationLoss(
+        focal_weight=FOCAL_WEIGHT,
         dice_weight=DICE_WEIGHT,
+        boundary_weight=BOUNDARY_WEIGHT,
+        negative_weight=NEGATIVE_WEIGHT,
+        focal_alpha=FOCAL_ALPHA,
+        focal_gamma=FOCAL_GAMMA,
+        negative_threshold=
+            NEGATIVE_THRESHOLD,
+    )
+
+    print(
+        "Focal weight    :",
+        FOCAL_WEIGHT,
+    )
+
+    print(
+        "Dice weight     :",
+        DICE_WEIGHT,
+    )
+
+    print(
+        "Boundary weight :",
+        BOUNDARY_WEIGHT,
+    )
+
+    print(
+        "Negative weight :",
+        NEGATIVE_WEIGHT,
+    )
+
+    print(
+        "Focal alpha     :",
+        FOCAL_ALPHA,
+    )
+
+    print(
+        "Focal gamma     :",
+        FOCAL_GAMMA,
+    )
+
+    print(
+        "Negative thresh :",
+        NEGATIVE_THRESHOLD,
     )
 
     # --------------------------------------------------------
@@ -846,9 +1165,10 @@ def main():
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
-        mode="max",
+        mode=CONFIG["scheduler"]["mode"],
         patience=LR_PATIENCE,
-        factor=0.5,
+        factor=LR_FACTOR,
+        min_lr=MIN_LR,
     )
 
     # --------------------------------------------------------
@@ -857,21 +1177,20 @@ def main():
 
     scaler = torch.amp.GradScaler(
         "cuda",
-        enabled=device.type == "cuda",
+        enabled=MIXED_PRECISION,
     )
 
     # --------------------------------------------------------
-    # RESUME STATE
+    # RESUME
     # --------------------------------------------------------
 
     start_epoch = 1
+
     best_val_dice = -1.0
+
     epochs_without_improvement = 0
 
-    resuming = (
-        RESUME
-        and LAST_CHECKPOINT.exists()
-    )
+    resuming = LAST_CHECKPOINT.exists()
 
     if resuming:
 
@@ -898,10 +1217,9 @@ def main():
 
     print()
     print("=" * 70)
-    print("TRAINING")
+    print("V2 TRAINING")
     print("=" * 70)
 
-    print()
     print(
         "Epochs              :",
         EPOCHS,
@@ -918,18 +1236,21 @@ def main():
     )
 
     print(
+        "Weight decay        :",
+        WEIGHT_DECAY,
+    )
+
+    print(
         "Mixed precision     :",
-        device.type == "cuda",
+        MIXED_PRECISION,
     )
 
     print(
-        "Checkpoint interval :",
-        "every epoch",
+        "Checkpoint interval : every epoch",
     )
 
     print(
-        "Resume enabled      :",
-        RESUME,
+        "Resume enabled      : True",
     )
 
     print(
@@ -948,20 +1269,19 @@ def main():
     )
 
     # --------------------------------------------------------
-    # IF ALREADY COMPLETE
+    # ALREADY COMPLETE
     # --------------------------------------------------------
 
     if start_epoch > EPOCHS:
 
         print()
         print(
-            "Requested training epochs "
-            "already completed."
+            "V2 training is already complete."
         )
 
         print(
             "Best validation Dice:",
-            f"{best_val_dice:.5f}",
+            f"{best_val_dice:.6f}",
         )
 
         return
@@ -975,7 +1295,7 @@ def main():
         EPOCHS + 1,
     ):
 
-        start = time.time()
+        epoch_start = time.time()
 
         print()
         print(
@@ -984,34 +1304,43 @@ def main():
 
         print("-" * 70)
 
-        train_loss, train_dice, train_iou = (
-            train_one_epoch(
-                model,
-                train_loader,
-                optimizer,
-                criterion,
-                scaler,
-                device,
-                epoch,
-            )
+        (
+            train_loss,
+            train_dice,
+            train_iou,
+        ) = train_one_epoch(
+            model=model,
+            loader=train_loader,
+            optimizer=optimizer,
+            criterion=criterion,
+            scaler=scaler,
+            device=device,
+            epoch=epoch,
         )
 
-        val_loss, val_dice, val_iou = (
-            validate(
-                model,
-                val_loader,
-                criterion,
-                device,
-            )
+        (
+            val_loss,
+            val_dice,
+            val_iou,
+        ) = validate(
+            model=model,
+            loader=val_loader,
+            criterion=criterion,
+            device=device,
         )
 
         scheduler.step(
             val_dice
         )
 
-        lr = optimizer.param_groups[0]["lr"]
+        current_lr = (
+            optimizer.param_groups[0]["lr"]
+        )
 
-        elapsed = time.time() - start
+        elapsed = (
+            time.time()
+            - epoch_start
+        )
 
         print()
         print(
@@ -1019,31 +1348,31 @@ def main():
         )
 
         print(
-            f"  Train loss : {train_loss:.5f}"
+            f"  Train loss : {train_loss:.6f}"
         )
 
         print(
-            f"  Train Dice : {train_dice:.5f}"
+            f"  Train Dice : {train_dice:.6f}"
         )
 
         print(
-            f"  Train IoU  : {train_iou:.5f}"
+            f"  Train IoU  : {train_iou:.6f}"
         )
 
         print(
-            f"  Val loss   : {val_loss:.5f}"
+            f"  Val loss   : {val_loss:.6f}"
         )
 
         print(
-            f"  Val Dice   : {val_dice:.5f}"
+            f"  Val Dice   : {val_dice:.6f}"
         )
 
         print(
-            f"  Val IoU    : {val_iou:.5f}"
+            f"  Val IoU    : {val_iou:.6f}"
         )
 
         print(
-            f"  LR         : {lr:.7f}"
+            f"  LR         : {current_lr:.8f}"
         )
 
         print(
@@ -1062,7 +1391,7 @@ def main():
             val_loss=val_loss,
             val_dice=val_dice,
             val_iou=val_iou,
-            learning_rate=lr,
+            learning_rate=current_lr,
             epoch_seconds=elapsed,
         )
 
@@ -1089,12 +1418,12 @@ def main():
 
             print()
             print(
-                "  ★ NEW BEST CHECKPOINT"
+                "★ NEW V2 BEST CHECKPOINT"
             )
 
             print(
-                f"  Val Dice: "
-                f"{best_val_dice:.5f}"
+                "  Val Dice:",
+                f"{best_val_dice:.6f}",
             )
 
         else:
@@ -1103,9 +1432,6 @@ def main():
 
         # ----------------------------------------------------
         # LAST CHECKPOINT
-        #
-        # ALWAYS saved.
-        # This is what makes Colab recovery possible.
         # ----------------------------------------------------
 
         save_checkpoint(
@@ -1121,12 +1447,7 @@ def main():
 
         print()
         print(
-            "  ✓ LAST CHECKPOINT SAVED"
-        )
-
-        print(
-            "  ",
-            LAST_CHECKPOINT,
+            "✓ V2 LAST CHECKPOINT SAVED"
         )
 
         # ----------------------------------------------------
@@ -1140,11 +1461,11 @@ def main():
 
             print()
             print(
-                "EARLY STOPPING"
+                "V2 EARLY STOPPING"
             )
 
             print(
-                f"No validation Dice improvement "
+                "No validation Dice improvement "
                 f"for {EARLY_STOPPING_PATIENCE} epochs."
             )
 
@@ -1156,43 +1477,30 @@ def main():
 
     print()
     print("=" * 70)
-    print("TRAINING COMPLETE")
+    print("V2 TRAINING COMPLETE")
     print("=" * 70)
 
-    print()
     print(
-        f"Best validation Dice: "
-        f"{best_val_dice:.5f}"
+        "Best validation Dice:",
+        f"{best_val_dice:.6f}",
     )
 
     print()
     print(
-        "Best checkpoint:"
+        "BEST:",
+        BEST_CHECKPOINT,
     )
 
     print(
-        BEST_CHECKPOINT
-    )
-
-    print()
-    print(
-        "Last checkpoint:"
+        "LAST:",
+        LAST_CHECKPOINT,
     )
 
     print(
-        LAST_CHECKPOINT
-    )
-
-    print()
-    print(
-        "Training log:"
-    )
-
-    print(
-        LOG_FILE
+        "LOG :",
+        LOG_FILE,
     )
 
 
 if __name__ == "__main__":
     main()
-
