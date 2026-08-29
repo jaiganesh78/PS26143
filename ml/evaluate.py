@@ -146,7 +146,44 @@ def load_checkpoint(
     checkpoint = torch.load(
         checkpoint_path,
         map_location=device,
+        weights_only=False,
     )
+
+    if isinstance(checkpoint, dict):
+
+        if "model_state_dict" in checkpoint:
+            state_dict = checkpoint[
+                "model_state_dict"
+            ]
+
+        elif "state_dict" in checkpoint:
+            state_dict = checkpoint[
+                "state_dict"
+            ]
+
+        else:
+            state_dict = checkpoint
+
+    else:
+        state_dict = checkpoint
+
+    # Handle checkpoints saved through
+    # DataParallel/DDP if ever encountered.
+    if any(
+        key.startswith("module.")
+        for key in state_dict.keys()
+    ):
+        state_dict = {
+            key.removeprefix("module."): value
+            for key, value in state_dict.items()
+        }
+
+    model.load_state_dict(
+        state_dict,
+        strict=True,
+    )
+
+    return checkpoint
 
     if isinstance(
         checkpoint,
