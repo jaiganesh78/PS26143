@@ -1,6 +1,6 @@
-experiment:
-  name: oil-seg-v1
-  seed: 42
+name: oil-seg-v1
+
+seed: 42
 
 data:
   image_size: 512
@@ -27,8 +27,14 @@ loss:
   bce_weight: 0.5
   dice_weight: 0.5
 
+scheduler:
+  type: reduce_on_plateau
+  mode: max
+  patience: 3
+  metric: val_dice
+
 early_stopping:
-  patience: 8
+  patience: 5
 
 evaluation:
   threshold: 0.5
