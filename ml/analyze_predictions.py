@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import math
 import random
 from pathlib import Path
 
@@ -19,25 +18,26 @@ from src.models.segmentation_model import build_model
 # PS26143 — CONSOLIDATED TEST ERROR ANALYSIS
 # ============================================================
 #
-# Purpose:
-#   Analyze the already-frozen 135-sample test set using the
-#   already-trained BEST checkpoint.
+# PURPOSE
+# -------
+# Analyze the already-frozen 135-sample test set using the
+# already-trained BEST checkpoint.
 #
-# This script DOES NOT:
+# THIS SCRIPT DOES NOT:
 #   - train
 #   - modify the model
 #   - modify the test set
 #   - tune the threshold
-#   - create a new checkpoint
+#   - create a checkpoint
 #
-# It DOES:
+# THIS SCRIPT DOES:
 #   - regenerate test predictions
-#   - calculate per-scene errors
-#   - rank worst oil segmentation
-#   - rank lookalike false positives
-#   - rank no-oil false positives
-#   - calculate boundary-quality indicators
-#   - create compact visual galleries
+#   - calculate per-scene metrics
+#   - identify oil segmentation failures
+#   - identify lookalike false positives
+#   - identify no-oil false positives
+#   - measure boundary disagreement
+#   - generate compact diagnostic galleries
 #   - save machine-readable analysis artifacts
 # ============================================================
 
@@ -84,9 +84,11 @@ GALLERY_DIR = (
 BATCH_SIZE = 16
 NUM_WORKERS = 0
 
+# IMPORTANT:
+# This remains the frozen baseline threshold.
+# We are NOT tuning it during this analysis.
 THRESHOLD = 0.5
 
-# Number of examples saved in each gallery.
 GALLERY_COUNT = 12
 
 
@@ -94,8 +96,7 @@ GALLERY_COUNT = 12
 # REPRODUCIBILITY
 # ============================================================
 
-def set_seed(seed: int = 42):
-
+def set_seed(seed: int = SEED):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -105,15 +106,14 @@ def set_seed(seed: int = 42):
 
 
 # ============================================================
-# CHECKPOINT
+# CHECKPOINT LOADING
 # ============================================================
 
 def load_checkpoint(
     model,
-    checkpoint_path,
+    checkpoint_path: Path,
     device,
 ):
-
     checkpoint = torch.load(
         checkpoint_path,
         map_location=device,
@@ -126,14 +126,10 @@ def load_checkpoint(
         )
 
     if "model_state_dict" in checkpoint:
-        state_dict = checkpoint[
-            "model_state_dict"
-        ]
+        state_dict = checkpoint["model_state_dict"]
 
     elif "state_dict" in checkpoint:
-        state_dict = checkpoint[
-            "state_dict"
-        ]
+        state_dict = checkpoint["state_dict"]
 
     else:
         state_dict = checkpoint
@@ -163,7 +159,6 @@ def calculate_metrics(
     prediction,
     target,
 ):
-
     prediction = prediction.astype(bool)
     target = target.astype(bool)
 
@@ -221,9 +216,6 @@ def calculate_metrics(
         prediction.sum()
     )
 
-    fp_area = int(fp)
-    fn_area = int(fn)
-
     return {
         "tp": int(tp),
         "fp": int(fp),
@@ -235,8 +227,8 @@ def calculate_metrics(
         "recall": float(recall),
         "target_area": target_area,
         "prediction_area": prediction_area,
-        "fp_area": fp_area,
-        "fn_area": fn_area,
+        "fp_area": int(fp),
+        "fn_area": int(fn),
     }
 
 
@@ -245,11 +237,8 @@ def calculate_metrics(
 # ============================================================
 
 def binary_boundary(mask):
-
     """
-    Approximate boundary pixels using a 4-neighbour erosion.
-
-    No external morphology package is required.
+    Approximate boundary pixels using 4-neighbour erosion.
     """
 
     mask = mask.astype(bool)
@@ -275,27 +264,25 @@ def binary_boundary(mask):
     right = padded[1:-1, 2:]
 
     erosion = (
-        center &
-        up &
-        down &
-        left &
-        right
+        center
+        & up
+        & down
+        & left
+        & right
     )
 
-    boundary = center & ~erosion
-
-    return boundary
+    return center & ~erosion
 
 
 def boundary_error(
     prediction,
     target,
 ):
-
     """
-    Measures how much predicted/target boundary disagrees.
+    Boundary disagreement indicator.
 
-    This is an indicator, not a formal Hausdorff distance.
+    This is intentionally NOT presented as a formal
+    Hausdorff distance.
     """
 
     pred_boundary = binary_boundary(
@@ -321,13 +308,10 @@ def boundary_error(
         return {
             "boundary_error": 0.0,
             "boundary_disagreement": 0.0,
-            "pred_boundary_pixels":
-                0,
-            "target_boundary_pixels":
-                0,
+            "pred_boundary_pixels": 0,
+            "target_boundary_pixels": 0,
         }
 
-    # One-pixel neighbourhood matching.
     padded_target = np.pad(
         target_boundary,
         1,
@@ -336,15 +320,15 @@ def boundary_error(
     )
 
     target_neighbourhood = (
-        padded_target[:-2, :-2] |
-        padded_target[:-2, 1:-1] |
-        padded_target[:-2, 2:] |
-        padded_target[1:-1, :-2] |
-        padded_target[1:-1, 1:-1] |
-        padded_target[1:-1, 2:] |
-        padded_target[2:, :-2] |
-        padded_target[2:, 1:-1] |
-        padded_target[2:, 2:]
+        padded_target[:-2, :-2]
+        | padded_target[:-2, 1:-1]
+        | padded_target[:-2, 2:]
+        | padded_target[1:-1, :-2]
+        | padded_target[1:-1, 1:-1]
+        | padded_target[1:-1, 2:]
+        | padded_target[2:, :-2]
+        | padded_target[2:, 1:-1]
+        | padded_target[2:, 2:]
     )
 
     padded_pred = np.pad(
@@ -355,66 +339,60 @@ def boundary_error(
     )
 
     pred_neighbourhood = (
-        padded_pred[:-2, :-2] |
-        padded_pred[:-2, 1:-1] |
-        padded_pred[:-2, 2:] |
-        padded_pred[1:-1, :-2] |
-        padded_pred[1:-1, 1:-1] |
-        padded_pred[1:-1, 2:] |
-        padded_pred[2:, :-2] |
-        padded_pred[2:, 1:-1] |
-        padded_pred[2:, 2:]
+        padded_pred[:-2, :-2]
+        | padded_pred[:-2, 1:-1]
+        | padded_pred[:-2, 2:]
+        | padded_pred[1:-1, :-2]
+        | padded_pred[1:-1, 1:-1]
+        | padded_pred[1:-1, 2:]
+        | padded_pred[2:, :-2]
+        | padded_pred[2:, 1:-1]
+        | padded_pred[2:, 2:]
     )
 
     pred_match = (
-        pred_boundary &
-        target_neighbourhood
+        pred_boundary
+        & target_neighbourhood
     )
 
     target_match = (
-        target_boundary &
-        pred_neighbourhood
+        target_boundary
+        & pred_neighbourhood
     )
 
     pred_boundary_accuracy = (
-        pred_match.sum() /
-        max(pred_boundary_count, 1)
+        pred_match.sum()
+        / max(pred_boundary_count, 1)
     )
 
     target_boundary_accuracy = (
-        target_match.sum() /
-        max(target_boundary_count, 1)
+        target_match.sum()
+        / max(target_boundary_count, 1)
     )
 
-    boundary_disagreement = 1.0 - (
+    disagreement = 1.0 - (
         0.5 *
         (
-            pred_boundary_accuracy +
-            target_boundary_accuracy
+            pred_boundary_accuracy
+            + target_boundary_accuracy
         )
     )
 
     return {
-        "boundary_error":
-            float(boundary_disagreement),
-        "boundary_disagreement":
-            float(boundary_disagreement),
-        "pred_boundary_pixels":
-            pred_boundary_count,
-        "target_boundary_pixels":
-            target_boundary_count,
+        "boundary_error": float(disagreement),
+        "boundary_disagreement": float(disagreement),
+        "pred_boundary_pixels": pred_boundary_count,
+        "target_boundary_pixels": target_boundary_count,
     }
 
 
 # ============================================================
-# IMAGE PREPARATION FOR VISUALIZATION
+# DISPLAY HELPERS
 # ============================================================
 
 def normalize_display_band(band):
 
-    band = band.astype(
-        np.float32
-    )
+    band = band.astype(np.float32)
 
     finite = np.isfinite(band)
 
@@ -456,8 +434,8 @@ def normalize_display_band(band):
     )
 
     band = (
-        (band - low) /
-        (high - low)
+        (band - low)
+        / (high - low)
     )
 
     return (
@@ -466,14 +444,6 @@ def normalize_display_band(band):
 
 
 def make_base_image(image):
-
-    """
-    Create an RGB display from VV/VH.
-
-    R = VV
-    G = VH
-    B = mean(VV,VH)
-    """
 
     vv = normalize_display_band(
         image[0]
@@ -485,17 +455,16 @@ def make_base_image(image):
 
     mean = (
         (
-            vv.astype(np.float32) +
-            vh.astype(np.float32)
-        ) / 2.0
+            vv.astype(np.float32)
+            + vh.astype(np.float32)
+        )
+        / 2.0
     ).astype(np.uint8)
 
-    rgb = np.stack(
+    return np.stack(
         [vv, vh, mean],
         axis=-1,
     )
-
-    return rgb
 
 
 def overlay_mask(
@@ -503,14 +472,12 @@ def overlay_mask(
     mask,
     mode,
 ):
-
     """
-    Overlay a mask without requiring matplotlib.
-
     mode:
-        target     = ground truth
-        prediction = prediction
-        error      = FP/FN
+        target     = red
+        prediction = green
+        fp         = blue
+        fn         = yellow
     """
 
     out = base.copy()
@@ -519,10 +486,9 @@ def overlay_mask(
 
     if mode == "target":
 
-        # Ground truth: bright red.
         out[mask] = (
-            0.55 * out[mask] +
-            0.45 * np.array(
+            0.55 * out[mask]
+            + 0.45 * np.array(
                 [255, 0, 0],
                 dtype=np.float32,
             )
@@ -530,10 +496,9 @@ def overlay_mask(
 
     elif mode == "prediction":
 
-        # Prediction: bright green.
         out[mask] = (
-            0.55 * out[mask] +
-            0.45 * np.array(
+            0.55 * out[mask]
+            + 0.45 * np.array(
                 [0, 255, 0],
                 dtype=np.float32,
             )
@@ -541,10 +506,9 @@ def overlay_mask(
 
     elif mode == "fp":
 
-        # False positives: blue.
         out[mask] = (
-            0.45 * out[mask] +
-            0.55 * np.array(
+            0.45 * out[mask]
+            + 0.55 * np.array(
                 [0, 80, 255],
                 dtype=np.float32,
             )
@@ -552,10 +516,9 @@ def overlay_mask(
 
     elif mode == "fn":
 
-        # False negatives: yellow.
         out[mask] = (
-            0.45 * out[mask] +
-            0.55 * np.array(
+            0.45 * out[mask]
+            + 0.55 * np.array(
                 [255, 255, 0],
                 dtype=np.float32,
             )
@@ -609,6 +572,34 @@ def save_case_gallery(
     case,
     output_path,
 ):
+    """
+    Robustly save one diagnostic case.
+
+    IMPORTANT:
+    Metadata lives inside case["record"].
+    This function therefore reads global_id/dataset from
+    the record instead of assuming they exist at the
+    top level of case.
+    """
+
+    record = case.get(
+        "record",
+        {}
+    )
+
+    global_id = str(
+        record.get(
+            "global_id",
+            "unknown",
+        )
+    )
+
+    dataset_name = str(
+        record.get(
+            "dataset",
+            "unknown",
+        )
+    )
 
     base = make_base_image(
         case["image"]
@@ -651,8 +642,8 @@ def save_case_gallery(
     )
 
     title_base = (
-        f"{case['global_id']} | "
-        f"{case['dataset']}"
+        f"{global_id} | "
+        f"{dataset_name}"
     )
 
     panels = [
@@ -708,6 +699,11 @@ def save_case_gallery(
 
         x += panel.width
 
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
     canvas.save(
         output_path,
         quality=95,
@@ -715,7 +711,7 @@ def save_case_gallery(
 
 
 # ============================================================
-# SELECT CASES
+# CASE SELECTION
 # ============================================================
 
 def choose_gallery_cases(
@@ -736,89 +732,73 @@ def choose_gallery_cases(
         results_df["dataset"] == "no_oil"
     ].copy()
 
-    # Worst segmentation.
     galleries["worst_oil_dice"] = (
         oil.sort_values(
             ["dice", "fn_area"],
             ascending=[True, False],
         )
         .head(GALLERY_COUNT)
-        .global_id
+        ["global_id"]
         .tolist()
     )
 
-    # Largest missed oil area.
     galleries["largest_oil_fn"] = (
         oil.sort_values(
             "fn_area",
             ascending=False,
         )
         .head(GALLERY_COUNT)
-        .global_id
+        ["global_id"]
         .tolist()
     )
 
-    # Worst oil boundary quality.
     galleries["worst_oil_boundary"] = (
         oil.sort_values(
             "boundary_error",
             ascending=False,
         )
         .head(GALLERY_COUNT)
-        .global_id
+        ["global_id"]
         .tolist()
     )
 
-    # Largest lookalike false positives.
-    galleries[
-        "lookalike_false_positives"
-    ] = (
+    galleries["lookalike_false_positives"] = (
         lookalike.sort_values(
             "fp_area",
             ascending=False,
         )
         .head(GALLERY_COUNT)
-        .global_id
+        ["global_id"]
         .tolist()
     )
 
-    # Highest-confidence-ish lookalike false positives
-    # represented here by largest predicted area.
-    galleries[
-        "lookalike_predicted_area"
-    ] = (
+    galleries["lookalike_predicted_area"] = (
         lookalike.sort_values(
             "prediction_area",
             ascending=False,
         )
         .head(GALLERY_COUNT)
-        .global_id
+        ["global_id"]
         .tolist()
     )
 
-    # Largest no-oil false positives.
-    galleries[
-        "no_oil_false_positives"
-    ] = (
+    galleries["no_oil_false_positives"] = (
         no_oil.sort_values(
             "fp_area",
             ascending=False,
         )
         .head(GALLERY_COUNT)
-        .global_id
+        ["global_id"]
         .tolist()
     )
 
-    # Largest no-oil predictions.
-    galleries[
-        "no_oil_predicted_area"
-    ] = (
+    galleries["no_oil_predicted_area"] = (
         no_oil.sort_values(
             "prediction_area",
             ascending=False,
         )
         .head(GALLERY_COUNT)
-        .global_id
+        ["global_id"]
         .tolist()
     )
 
@@ -831,7 +811,7 @@ def choose_gallery_cases(
 
 def main():
 
-    set_seed(SEED)
+    set_seed()
 
     print("=" * 70)
     print(
@@ -853,7 +833,6 @@ def main():
     print("Device:", device)
 
     if device.type == "cuda":
-
         print(
             "GPU:",
             torch.cuda.get_device_name(0),
@@ -892,7 +871,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # Load manifest
+    # Manifest
     # --------------------------------------------------------
 
     df = pd.read_csv(
@@ -903,6 +882,24 @@ def main():
         raise RuntimeError(
             f"Expected 135 test samples, "
             f"found {len(df)}."
+        )
+
+    required_columns = {
+        "global_id",
+        "dataset",
+        "image",
+        "mask",
+    }
+
+    missing_columns = (
+        required_columns
+        - set(df.columns)
+    )
+
+    if missing_columns:
+        raise RuntimeError(
+            "Test manifest missing columns: "
+            f"{sorted(missing_columns)}"
         )
 
     if df["global_id"].duplicated().any():
@@ -926,23 +923,27 @@ def main():
     # --------------------------------------------------------
 
     missing_images = [
-        p for p in df["image"]
+        p
+        for p in df["image"]
         if not Path(p).exists()
     ]
 
     missing_masks = [
-        p for p in df["mask"]
+        p
+        for p in df["mask"]
         if not Path(p).exists()
     ]
 
     if missing_images:
         raise FileNotFoundError(
-            missing_images[:5]
+            "Missing test images: "
+            f"{missing_images[:5]}"
         )
 
     if missing_masks:
         raise FileNotFoundError(
-            missing_masks[:5]
+            "Missing test masks: "
+            f"{missing_masks[:5]}"
         )
 
     print()
@@ -1014,9 +1015,7 @@ def main():
         if "best_val_dice" in checkpoint:
             print(
                 "Best validation Dice:",
-                checkpoint[
-                    "best_val_dice"
-                ],
+                checkpoint["best_val_dice"],
             )
 
     # --------------------------------------------------------
@@ -1108,11 +1107,11 @@ def main():
                     .astype(bool)
                 )
 
-                global_id = (
+                global_id = str(
                     batch["global_id"][i]
                 )
 
-                dataset_name = (
+                dataset_name = str(
                     batch["dataset"][i]
                 )
 
@@ -1126,12 +1125,10 @@ def main():
                     target_np,
                 )
 
-                # Scene-level false alarm.
                 scene_positive = bool(
                     prediction_np.any()
                 )
 
-                # For oil scenes.
                 target_positive = bool(
                     target_np.any()
                 )
@@ -1196,30 +1193,20 @@ def main():
                         metrics["fn_area"],
 
                     "target_fraction":
-                        metrics[
-                            "target_area"
-                        ] / (
-                            target_np.size
-                        ),
+                        metrics["target_area"]
+                        / target_np.size,
 
                     "prediction_fraction":
-                        metrics[
-                            "prediction_area"
-                        ] / (
-                            prediction_np.size
-                        ),
+                        metrics["prediction_area"]
+                        / prediction_np.size,
 
                     "fp_fraction":
-                        metrics["fp_area"] / (
-                            prediction_np.size
-                        ),
+                        metrics["fp_area"]
+                        / prediction_np.size,
 
                     "fn_fraction":
-                        metrics["fn_area"] / (
-                            target_np.size
-                            if target_np.size
-                            else 1
-                        ),
+                        metrics["fn_area"]
+                        / max(target_np.size, 1),
 
                     "boundary_error":
                         boundary[
@@ -1267,6 +1254,8 @@ def main():
                     "probability":
                         probability_np,
 
+                    # IMPORTANT:
+                    # Metadata is kept inside record.
                     "record":
                         record,
                 }
@@ -1274,7 +1263,8 @@ def main():
                 processed += 1
 
         print(
-            f"Processed: {processed}/{len(dataset)}"
+            f"Processed: "
+            f"{processed}/{len(dataset)}"
         )
 
     if processed != 135:
@@ -1294,13 +1284,15 @@ def main():
         ]
     )
 
-    results_df = results_df.sort_values(
-        [
-            "dataset",
-            "global_id",
-        ]
-    ).reset_index(
-        drop=True
+    results_df = (
+        results_df
+        .sort_values(
+            [
+                "dataset",
+                "global_id",
+            ]
+        )
+        .reset_index(drop=True)
     )
 
     results_df.to_csv(
@@ -1309,7 +1301,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # Aggregate analysis
+    # Aggregate summary
     # --------------------------------------------------------
 
     summary = {
@@ -1344,12 +1336,18 @@ def main():
         "encoder":
             "ResNet34",
 
+        "in_channels":
+            2,
+
+        "classes":
+            1,
+
         "image_size":
             512,
     }
 
     # --------------------------------------------------------
-    # Per-dataset summary
+    # Dataset summaries
     # --------------------------------------------------------
 
     dataset_summary = {}
@@ -1372,46 +1370,32 @@ def main():
                 int(len(subset)),
 
             "mean_dice":
-                float(
-                    subset["dice"].mean()
-                ),
+                float(subset["dice"].mean()),
 
             "median_dice":
-                float(
-                    subset["dice"].median()
-                ),
+                float(subset["dice"].median()),
 
             "mean_iou":
-                float(
-                    subset["iou"].mean()
-                ),
+                float(subset["iou"].mean()),
 
             "mean_precision":
                 float(
-                    subset[
-                        "precision"
-                    ].mean()
+                    subset["precision"].mean()
                 ),
 
             "mean_recall":
                 float(
-                    subset[
-                        "recall"
-                    ].mean()
+                    subset["recall"].mean()
                 ),
 
             "mean_fp_area":
                 float(
-                    subset[
-                        "fp_area"
-                    ].mean()
+                    subset["fp_area"].mean()
                 ),
 
             "mean_fn_area":
                 float(
-                    subset[
-                        "fn_area"
-                    ].mean()
+                    subset["fn_area"].mean()
                 ),
 
             "mean_boundary_error":
@@ -1429,9 +1413,7 @@ def main():
                 ),
         }
 
-    summary[
-        "by_dataset"
-    ] = dataset_summary
+    summary["by_dataset"] = dataset_summary
 
     # --------------------------------------------------------
     # Oil analysis
@@ -1441,40 +1423,37 @@ def main():
         results_df["dataset"] == "oil"
     ]
 
-    oil_detected = (
+    oil_detected = int(
         oil[
             "scene_prediction_positive"
         ].sum()
     )
 
-    summary[
-        "oil_analysis"
-    ] = {
+    summary["oil_analysis"] = {
         "samples":
             int(len(oil)),
 
         "scene_detection_count":
-            int(oil_detected),
+            oil_detected,
 
         "scene_detection_rate":
             float(
-                oil_detected /
-                max(len(oil), 1)
+                oil_detected
+                / max(len(oil), 1)
             ),
 
         "mean_dice":
-            float(
-                oil["dice"].mean()
-            ),
+            float(oil["dice"].mean()),
 
         "mean_iou":
-            float(
-                oil["iou"].mean()
-            ),
+            float(oil["iou"].mean()),
 
         "mean_recall":
+            float(oil["recall"].mean()),
+
+        "mean_precision":
             float(
-                oil["recall"].mean()
+                oil["precision"].mean()
             ),
 
         "mean_fn_area":
@@ -1499,25 +1478,23 @@ def main():
         == "lookalike"
     ]
 
-    lookalike_fp = (
+    lookalike_fp = int(
         lookalike[
             "scene_prediction_positive"
         ].sum()
     )
 
-    summary[
-        "lookalike_rejection"
-    ] = {
+    summary["lookalike_rejection"] = {
         "samples":
             int(len(lookalike)),
 
         "false_positive_scenes":
-            int(lookalike_fp),
+            lookalike_fp,
 
         "false_alarm_rate":
             float(
-                lookalike_fp /
-                max(len(lookalike), 1)
+                lookalike_fp
+                / max(len(lookalike), 1)
             ),
 
         "mean_predicted_area":
@@ -1551,25 +1528,23 @@ def main():
         == "no_oil"
     ]
 
-    no_oil_fp = (
+    no_oil_fp = int(
         no_oil[
             "scene_prediction_positive"
         ].sum()
     )
 
-    summary[
-        "no_oil_rejection"
-    ] = {
+    summary["no_oil_rejection"] = {
         "samples":
             int(len(no_oil)),
 
         "false_positive_scenes":
-            int(no_oil_fp),
+            no_oil_fp,
 
         "false_alarm_rate":
             float(
-                no_oil_fp /
-                max(len(no_oil), 1)
+                no_oil_fp
+                / max(len(no_oil), 1)
             ),
 
         "mean_predicted_area":
@@ -1598,9 +1573,7 @@ def main():
     # Worst cases
     # --------------------------------------------------------
 
-    summary[
-        "worst_cases"
-    ] = {
+    summary["worst_cases"] = {
         "oil_lowest_dice":
             oil.sort_values(
                 "dice"
@@ -1610,6 +1583,7 @@ def main():
                     "dice",
                     "iou",
                     "recall",
+                    "precision",
                     "fn_area",
                     "boundary_error",
                 ]
@@ -1628,6 +1602,7 @@ def main():
                     "iou",
                     "recall",
                     "fn_area",
+                    "boundary_error",
                 ]
             ].to_dict(
                 orient="records"
@@ -1681,7 +1656,7 @@ def main():
     }
 
     # --------------------------------------------------------
-    # Save summary
+    # Save initial summary
     # --------------------------------------------------------
 
     with open(
@@ -1754,6 +1729,7 @@ def main():
         ] = {
             "count":
                 len(saved),
+
             "files":
                 saved,
         }
@@ -1763,11 +1739,11 @@ def main():
             f"{len(saved)}"
         )
 
-    summary[
-        "galleries"
-    ] = gallery_summary
+    summary["galleries"] = (
+        gallery_summary
+    )
 
-    # Rewrite summary including gallery info.
+    # Rewrite summary with gallery info.
     with open(
         SUMMARY_JSON,
         "w",
@@ -1790,14 +1766,11 @@ def main():
     print("=" * 70)
 
     print()
-
-    print(
-        "OIL SCENES:"
-    )
+    print("OIL SCENES:")
 
     print(
         f"  Detection: "
-        f"{int(oil_detected)}/{len(oil)} "
+        f"{oil_detected}/{len(oil)} "
         f"("
         f"{100.0 * oil_detected / max(len(oil), 1):.2f}%"
         f")"
@@ -1814,6 +1787,11 @@ def main():
     )
 
     print(
+        f"  Mean Precision: "
+        f"{oil['precision'].mean():.4f}"
+    )
+
+    print(
         f"  Mean Recall: "
         f"{oil['recall'].mean():.4f}"
     )
@@ -1825,13 +1803,11 @@ def main():
 
     print()
 
-    print(
-        "LOOKALIKE:"
-    )
+    print("LOOKALIKE:")
 
     print(
         f"  False-positive scenes: "
-        f"{int(lookalike_fp)}/{len(lookalike)}"
+        f"{lookalike_fp}/{len(lookalike)}"
     )
 
     print(
@@ -1846,13 +1822,11 @@ def main():
 
     print()
 
-    print(
-        "NO-OIL:"
-    )
+    print("NO-OIL:")
 
     print(
         f"  False-positive scenes: "
-        f"{int(no_oil_fp)}/{len(no_oil)}"
+        f"{no_oil_fp}/{len(no_oil)}"
     )
 
     print(
@@ -1867,9 +1841,7 @@ def main():
 
     print()
 
-    print(
-        "Worst oil Dice cases:"
-    )
+    print("Worst oil Dice cases:")
 
     for row in summary[
         "worst_cases"
@@ -1881,6 +1853,7 @@ def main():
             f"  {row['global_id']:20s} "
             f"Dice={row['dice']:.4f} "
             f"IoU={row['iou']:.4f} "
+            f"Recall={row['recall']:.4f} "
             f"FN={row['fn_area']}"
         )
 
