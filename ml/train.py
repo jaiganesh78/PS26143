@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import csv
 import os
 import random
@@ -14,35 +15,106 @@ from torch.utils.data import DataLoader
 
 from src.datasets.oil_dataset import OilSegmentationDataset
 from src.models.segmentation_model import build_model
-from src.training.losses import V2SegmentationLoss
+from src.training.losses import V4SegmentationLoss
 
 
 # ============================================================
-# PS26143 — V2 SEGMENTATION TRAINING
+# PS26143 — V4 SEGMENTATION TRAINING
 # ============================================================
+
 
 REPO = Path("/content/PS26143")
 DRIVE_ROOT = Path("/content/drive/MyDrive/PS26143")
 
-CONFIG_FILE = REPO / "ml/configs/train_baseline.yaml"
 
-PROCESSED_ROOT = DRIVE_ROOT / "data/processed"
+# ============================================================
+# ARGUMENTS
+# ============================================================
+
+
+def parse_args():
+
+    parser = argparse.ArgumentParser(
+        description="PS26143 V4 segmentation training"
+    )
+
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to V4 YAML configuration.",
+    )
+
+    return parser.parse_args()
+
+
+ARGS = parse_args()
+
+
+# ============================================================
+# CONFIGURATION PATH
+# ============================================================
+
+
+if ARGS.config is not None:
+
+    CONFIG_FILE = Path(
+        ARGS.config
+    )
+
+else:
+
+    CONFIG_FILE = (
+        REPO
+        / "ml"
+        / "configs"
+        / "train_v4.yaml"
+    )
+
+
+# ============================================================
+# DRIVE PATHS
+# ============================================================
+
+
+PROCESSED_ROOT = (
+    DRIVE_ROOT
+    / "data"
+    / "processed"
+)
+
 
 TRAIN_MANIFEST = (
-    PROCESSED_ROOT / "train/manifest.csv"
+    PROCESSED_ROOT
+    / "train"
+    / "manifest.csv"
 )
+
 
 VAL_MANIFEST = (
-    PROCESSED_ROOT / "val/manifest.csv"
+    PROCESSED_ROOT
+    / "val"
+    / "manifest.csv"
 )
 
-CHECKPOINT_DIR = DRIVE_ROOT / "checkpoints"
-LOG_DIR = DRIVE_ROOT / "logs"
+
+CHECKPOINT_DIR = (
+    DRIVE_ROOT
+    / "checkpoints"
+)
+
+
+LOG_DIR = (
+    DRIVE_ROOT
+    / "logs"
+)
+
 
 CHECKPOINT_DIR.mkdir(
     parents=True,
     exist_ok=True,
 )
+
 
 LOG_DIR.mkdir(
     parents=True,
@@ -51,49 +123,126 @@ LOG_DIR.mkdir(
 
 
 # ============================================================
-# CONFIGURATION
+# CONFIG LOADING
 # ============================================================
 
+
 def load_config():
+
     if not CONFIG_FILE.exists():
+
         raise FileNotFoundError(
-            f"Configuration file missing: {CONFIG_FILE}"
+            "\n"
+            "V4 CONFIGURATION ERROR\n"
+            f"Configuration file does not exist:\n"
+            f"  {CONFIG_FILE}\n"
+            "\n"
+            "Expected:\n"
+            "  ml/configs/train_v4.yaml\n"
         )
 
-    with CONFIG_FILE.open(
-        "r",
-        encoding="utf-8",
-    ) as f:
-        config = yaml.safe_load(f)
+    try:
+
+        with CONFIG_FILE.open(
+            "r",
+            encoding="utf-8",
+        ) as f:
+
+            config = yaml.safe_load(f)
+
+    except Exception as exc:
+
+        raise RuntimeError(
+            "\n"
+            "V4 CONFIGURATION ERROR\n"
+            f"Could not parse YAML:\n"
+            f"  {CONFIG_FILE}\n"
+            f"\nActual error:\n{exc}"
+        ) from exc
+
+    if not isinstance(config, dict):
+
+        raise ValueError(
+            "V4 configuration must contain "
+            "a YAML mapping/object."
+        )
 
     return config
 
 
 CONFIG = load_config()
 
-EXPERIMENT_NAME = CONFIG["name"]
 
-SEED = int(CONFIG["seed"])
+# ============================================================
+# CONFIG VALIDATION
+# ============================================================
+
+
+def require_config(path, key):
+
+    if key not in path:
+
+        raise KeyError(
+            f"V4 configuration missing required key: "
+            f"{key}"
+        )
+
+    return path[key]
+
+
+EXPERIMENT_NAME = str(
+    require_config(
+        CONFIG,
+        "name",
+    )
+)
+
+
+if EXPERIMENT_NAME != "oil-seg-v4":
+
+    raise ValueError(
+        "\n"
+        "V4 SAFETY CHECK FAILED\n"
+        f"Expected config name: oil-seg-v4\n"
+        f"Found: {EXPERIMENT_NAME}\n"
+        "\n"
+        "This prevents accidentally running "
+        "another experiment with V4 checkpoints."
+    )
+
+
+SEED = int(
+    require_config(
+        CONFIG,
+        "seed",
+    )
+)
+
 
 IMAGE_SIZE = int(
     CONFIG["data"]["image_size"]
 )
 
+
 BATCH_SIZE = int(
     CONFIG["training"]["batch_size"]
 )
+
 
 EPOCHS = int(
     CONFIG["training"]["epochs"]
 )
 
+
 LEARNING_RATE = float(
     CONFIG["training"]["learning_rate"]
 )
 
+
 WEIGHT_DECAY = float(
     CONFIG["training"]["weight_decay"]
 )
+
 
 MIXED_PRECISION = bool(
     CONFIG["training"].get(
@@ -102,6 +251,7 @@ MIXED_PRECISION = bool(
     )
 )
 
+
 NUM_WORKERS = int(
     CONFIG["training"].get(
         "num_workers",
@@ -109,81 +259,187 @@ NUM_WORKERS = int(
     )
 )
 
+
 THRESHOLD = float(
     CONFIG["evaluation"]["threshold"]
 )
 
+
+# ============================================================
+# SCHEDULER
+# ============================================================
+
+
+SCHEDULER_CONFIG = CONFIG[
+    "scheduler"
+]
+
+
 LR_PATIENCE = int(
-    CONFIG["scheduler"]["patience"]
+    SCHEDULER_CONFIG["patience"]
 )
+
 
 LR_FACTOR = float(
-    CONFIG["scheduler"]["factor"]
+    SCHEDULER_CONFIG["factor"]
 )
 
+
 MIN_LR = float(
-    CONFIG["scheduler"].get(
+    SCHEDULER_CONFIG.get(
         "min_lr",
         0.0,
     )
 )
 
+
+# ============================================================
+# EARLY STOPPING
+# ============================================================
+
+
 EARLY_STOPPING_PATIENCE = int(
-    CONFIG["early_stopping"]["patience"]
+    CONFIG[
+        "early_stopping"
+    ]["patience"]
 )
 
-FOCAL_WEIGHT = float(
-    CONFIG["loss"]["focal_weight"]
+
+# ============================================================
+# V4 LOSS CONFIGURATION
+# ============================================================
+
+
+LOSS_CONFIG = CONFIG[
+    "loss"
+]
+
+
+LOSS_TYPE = str(
+    LOSS_CONFIG.get(
+        "type",
+        "v4",
+    )
 )
+
+
+if LOSS_TYPE != "v4":
+
+    raise ValueError(
+        "\n"
+        "V4 SAFETY CHECK FAILED\n"
+        f"Expected loss.type = v4\n"
+        f"Found: {LOSS_TYPE}"
+    )
+
+
+TVERSKY_WEIGHT = float(
+    LOSS_CONFIG.get(
+        "tversky_weight",
+        0.40,
+    )
+)
+
 
 DICE_WEIGHT = float(
-    CONFIG["loss"]["dice_weight"]
+    LOSS_CONFIG.get(
+        "dice_weight",
+        0.25,
+    )
 )
+
+
+FOCAL_WEIGHT = float(
+    LOSS_CONFIG.get(
+        "focal_weight",
+        0.20,
+    )
+)
+
 
 BOUNDARY_WEIGHT = float(
-    CONFIG["loss"]["boundary_weight"]
+    LOSS_CONFIG.get(
+        "boundary_weight",
+        0.10,
+    )
 )
+
 
 NEGATIVE_WEIGHT = float(
-    CONFIG["loss"]["negative_weight"]
+    LOSS_CONFIG.get(
+        "negative_weight",
+        0.05,
+    )
 )
+
+
+TVERSKY_ALPHA = float(
+    LOSS_CONFIG.get(
+        "tversky_alpha",
+        0.30,
+    )
+)
+
+
+TVERSKY_BETA = float(
+    LOSS_CONFIG.get(
+        "tversky_beta",
+        0.70,
+    )
+)
+
 
 FOCAL_ALPHA = float(
-    CONFIG["loss"]["focal_alpha"]
+    LOSS_CONFIG.get(
+        "focal_alpha",
+        0.60,
+    )
 )
+
 
 FOCAL_GAMMA = float(
-    CONFIG["loss"]["focal_gamma"]
+    LOSS_CONFIG.get(
+        "focal_gamma",
+        2.0,
+    )
 )
+
 
 NEGATIVE_THRESHOLD = float(
-    CONFIG["loss"]["negative_threshold"]
+    LOSS_CONFIG.get(
+        "negative_threshold",
+        0.30,
+    )
 )
 
 
 # ============================================================
-# V2 CHECKPOINTS
+# V4 CHECKPOINTS
 # ============================================================
+
 
 BEST_CHECKPOINT = (
     CHECKPOINT_DIR
-    / "oil_seg_v2_best.pt"
+    / "oil_seg_v4_best.pt"
 )
+
 
 LAST_CHECKPOINT = (
     CHECKPOINT_DIR
-    / "oil_seg_v2_last.pt"
+    / "oil_seg_v4_last.pt"
 )
+
 
 LOG_FILE = (
     LOG_DIR
-    / "oil_seg_v2_training.csv"
+    / "oil_seg_v4_training.csv"
 )
 
 
 # ============================================================
 # REPRODUCIBILITY
 # ============================================================
+
 
 def seed_everything(seed: int):
 
@@ -194,9 +450,13 @@ def seed_everything(seed: int):
     torch.manual_seed(seed)
 
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+
+        torch.cuda.manual_seed_all(
+            seed
+        )
 
     torch.backends.cudnn.deterministic = True
+
     torch.backends.cudnn.benchmark = False
 
 
@@ -204,26 +464,38 @@ def seed_everything(seed: int):
 # METRICS
 # ============================================================
 
+
 def dice_score(
     logits,
     targets,
     threshold=0.5,
     smooth=1.0,
 ):
-    probabilities = torch.sigmoid(logits)
+
+    probabilities = torch.sigmoid(
+        logits
+    )
 
     predictions = (
         probabilities >= threshold
     ).float()
 
-    predictions = predictions.contiguous().view(
-        predictions.size(0),
-        -1,
+    predictions = (
+        predictions
+        .contiguous()
+        .view(
+            predictions.size(0),
+            -1,
+        )
     )
 
-    targets = targets.contiguous().view(
-        targets.size(0),
-        -1,
+    targets = (
+        targets
+        .contiguous()
+        .view(
+            targets.size(0),
+            -1,
+        )
     )
 
     intersection = (
@@ -231,7 +503,8 @@ def dice_score(
     ).sum(dim=1)
 
     dice = (
-        2.0 * intersection + smooth
+        2.0 * intersection
+        + smooth
     ) / (
         predictions.sum(dim=1)
         + targets.sum(dim=1)
@@ -247,20 +520,31 @@ def iou_score(
     threshold=0.5,
     smooth=1.0,
 ):
-    probabilities = torch.sigmoid(logits)
+
+    probabilities = torch.sigmoid(
+        logits
+    )
 
     predictions = (
         probabilities >= threshold
     ).float()
 
-    predictions = predictions.contiguous().view(
-        predictions.size(0),
-        -1,
+    predictions = (
+        predictions
+        .contiguous()
+        .view(
+            predictions.size(0),
+            -1,
+        )
     )
 
-    targets = targets.contiguous().view(
-        targets.size(0),
-        -1,
+    targets = (
+        targets
+        .contiguous()
+        .view(
+            targets.size(0),
+            -1,
+        )
     )
 
     intersection = (
@@ -286,14 +570,33 @@ def iou_score(
 # DATA
 # ============================================================
 
-def load_records(path: Path):
+
+def load_records(
+    path: Path,
+):
 
     if not path.exists():
+
         raise FileNotFoundError(
-            f"Manifest missing: {path}"
+            "\n"
+            "DATA ERROR\n"
+            f"Manifest does not exist:\n"
+            f"  {path}"
         )
 
-    df = pd.read_csv(path)
+    try:
+
+        df = pd.read_csv(
+            path
+        )
+
+    except Exception as exc:
+
+        raise RuntimeError(
+            f"Could not read manifest:\n"
+            f"{path}\n"
+            f"\nActual error:\n{exc}"
+        ) from exc
 
     required = {
         "global_id",
@@ -304,21 +607,24 @@ def load_records(path: Path):
         "mask",
     }
 
-    missing = required - set(
-        df.columns
+    missing = (
+        required
+        - set(df.columns)
     )
 
     if missing:
+
         raise ValueError(
-            f"Manifest {path} missing columns: "
+            "\n"
+            "DATA MANIFEST ERROR\n"
+            f"Manifest: {path}\n"
+            f"Missing columns: "
             f"{sorted(missing)}"
         )
 
-    records = df.to_dict(
+    return df.to_dict(
         "records"
     )
-
-    return records
 
 
 def verify_records(
@@ -326,19 +632,31 @@ def verify_records(
     expected_split,
     expected_count,
 ):
+
     if len(records) != expected_count:
+
         raise ValueError(
-            f"{expected_split}: expected "
-            f"{expected_count} records, got "
-            f"{len(records)}"
+            "\n"
+            "DATA SPLIT SAFETY ERROR\n"
+            f"Split: {expected_split}\n"
+            f"Expected records: "
+            f"{expected_count}\n"
+            f"Found: {len(records)}"
         )
 
     for record in records:
 
         if record["split"] != expected_split:
+
             raise ValueError(
-                f"Manifest split mismatch: "
-                f"{record['global_id']}"
+                "\n"
+                "DATA SPLIT SAFETY ERROR\n"
+                f"Expected split: "
+                f"{expected_split}\n"
+                f"Record: "
+                f"{record['global_id']}\n"
+                f"Found split: "
+                f"{record['split']}"
             )
 
         image = Path(
@@ -350,19 +668,32 @@ def verify_records(
         )
 
         if not image.exists():
+
             raise FileNotFoundError(
-                f"Missing image: {image}"
+                "\n"
+                "DATA FILE ERROR\n"
+                f"Missing image:\n"
+                f"  {image}\n"
+                f"Scene: "
+                f"{record['global_id']}"
             )
 
         if not mask.exists():
+
             raise FileNotFoundError(
-                f"Missing mask: {mask}"
+                "\n"
+                "DATA FILE ERROR\n"
+                f"Missing mask:\n"
+                f"  {mask}\n"
+                f"Scene: "
+                f"{record['global_id']}"
             )
 
 
 # ============================================================
 # TRAINING
 # ============================================================
+
 
 def train_one_epoch(
     model,
@@ -382,17 +713,27 @@ def train_one_epoch(
 
     total = len(loader)
 
+    if total == 0:
+
+        raise RuntimeError(
+            "Training DataLoader contains zero batches."
+        )
+
     for step, batch in enumerate(
         loader,
         start=1,
     ):
 
-        images = batch["image"].to(
+        images = batch[
+            "image"
+        ].to(
             device,
             non_blocking=True,
         )
 
-        masks = batch["mask"].to(
+        masks = batch[
+            "mask"
+        ].to(
             device,
             non_blocking=True,
         )
@@ -410,11 +751,28 @@ def train_one_epoch(
             ),
         ):
 
-            logits = model(images)
+            logits = model(
+                images
+            )
 
             loss = criterion(
                 logits,
                 masks,
+            )
+
+        if not torch.isfinite(
+            loss
+        ):
+
+            raise RuntimeError(
+                "\n"
+                "V4 TRAINING NUMERICAL ERROR\n"
+                f"Epoch: {epoch}\n"
+                f"Batch: {step}\n"
+                f"Loss: {loss.item()}\n"
+                "\n"
+                "The loss became NaN/Inf. "
+                "Training has been stopped."
             )
 
         if scaler.is_enabled():
@@ -435,8 +793,10 @@ def train_one_epoch(
 
             optimizer.step()
 
+        loss_value = loss.item()
+
         running_loss += (
-            loss.item()
+            loss_value
         )
 
         running_dice += dice_score(
@@ -461,7 +821,7 @@ def train_one_epoch(
                 f"    batch "
                 f"{step:3d}/{total} "
                 f"| loss "
-                f"{loss.item():.5f}",
+                f"{loss_value:.6f}",
                 flush=True,
             )
 
@@ -475,6 +835,7 @@ def train_one_epoch(
 # ============================================================
 # VALIDATION
 # ============================================================
+
 
 @torch.no_grad()
 def validate(
@@ -492,14 +853,24 @@ def validate(
 
     total = len(loader)
 
+    if total == 0:
+
+        raise RuntimeError(
+            "Validation DataLoader contains zero batches."
+        )
+
     for batch in loader:
 
-        images = batch["image"].to(
+        images = batch[
+            "image"
+        ].to(
             device,
             non_blocking=True,
         )
 
-        masks = batch["mask"].to(
+        masks = batch[
+            "mask"
+        ].to(
             device,
             non_blocking=True,
         )
@@ -513,11 +884,23 @@ def validate(
             ),
         ):
 
-            logits = model(images)
+            logits = model(
+                images
+            )
 
             loss = criterion(
                 logits,
                 masks,
+            )
+
+        if not torch.isfinite(
+            loss
+        ):
+
+            raise RuntimeError(
+                "\n"
+                "V4 VALIDATION NUMERICAL ERROR\n"
+                f"Loss: {loss.item()}"
             )
 
         running_loss += (
@@ -547,6 +930,7 @@ def validate(
 # CHECKPOINT
 # ============================================================
 
+
 def checkpoint_payload(
     model,
     optimizer,
@@ -563,7 +947,7 @@ def checkpoint_payload(
             EXPERIMENT_NAME,
 
         "version":
-            "v2",
+            "v4",
 
         "epoch":
             epoch,
@@ -632,11 +1016,11 @@ def checkpoint_payload(
             torch.__version__,
 
         "cuda_device":
-            (
-                torch.cuda.get_device_name(0)
-                if torch.cuda.is_available()
-                else "cpu"
-            ),
+        (
+            torch.cuda.get_device_name(0)
+            if torch.cuda.is_available()
+            else "cpu"
+        ),
 
         "python_random_state":
             random.getstate(),
@@ -648,11 +1032,11 @@ def checkpoint_payload(
             torch.get_rng_state(),
 
         "torch_cuda_random_state":
-            (
-                torch.cuda.get_rng_state_all()
-                if torch.cuda.is_available()
-                else None
-            ),
+        (
+            torch.cuda.get_rng_state_all()
+            if torch.cuda.is_available()
+            else None
+        ),
     }
 
 
@@ -708,6 +1092,7 @@ def save_checkpoint(
 # RESUME
 # ============================================================
 
+
 def restore_checkpoint(
     path,
     model,
@@ -719,43 +1104,82 @@ def restore_checkpoint(
 
     print()
     print("=" * 70)
-    print("RESUMING V2 TRAINING")
+    print("RESUMING V4 TRAINING")
     print("=" * 70)
 
-    checkpoint = torch.load(
-        path,
-        map_location=device,
-        weights_only=False,
-    )
+    try:
+
+        checkpoint = torch.load(
+            path,
+            map_location=device,
+            weights_only=False,
+        )
+
+    except Exception as exc:
+
+        raise RuntimeError(
+            "\n"
+            "V4 CHECKPOINT LOAD ERROR\n"
+            f"Checkpoint:\n{path}\n"
+            f"\nActual error:\n{exc}"
+        ) from exc
 
     if checkpoint.get(
         "version"
-    ) != "v2":
+    ) != "v4":
 
         raise RuntimeError(
-            "The existing checkpoint is not a V2 "
-            "checkpoint. Refusing to resume from "
-            "another experiment."
+            "\n"
+            "V4 CHECKPOINT SAFETY ERROR\n"
+            f"Checkpoint: {path}\n"
+            f"Found version: "
+            f"{checkpoint.get('version')}\n"
+            "Expected version: v4\n"
+            "\n"
+            "Refusing to resume from V1/V2/V3 "
+            "or an unrelated experiment."
+        )
+
+    if checkpoint.get(
+        "experiment"
+    ) != EXPERIMENT_NAME:
+
+        raise RuntimeError(
+            "\n"
+            "V4 CHECKPOINT EXPERIMENT MISMATCH\n"
+            f"Expected: {EXPERIMENT_NAME}\n"
+            f"Found: "
+            f"{checkpoint.get('experiment')}"
         )
 
     model.load_state_dict(
-        checkpoint["model_state_dict"]
+        checkpoint[
+            "model_state_dict"
+        ]
     )
 
     optimizer.load_state_dict(
-        checkpoint["optimizer_state_dict"]
+        checkpoint[
+            "optimizer_state_dict"
+        ]
     )
 
     scheduler.load_state_dict(
-        checkpoint["scheduler_state_dict"]
+        checkpoint[
+            "scheduler_state_dict"
+        ]
     )
 
     if "scaler_state_dict" in checkpoint:
+
         scaler.load_state_dict(
-            checkpoint["scaler_state_dict"]
+            checkpoint[
+                "scaler_state_dict"
+            ]
         )
 
     if "python_random_state" in checkpoint:
+
         random.setstate(
             checkpoint[
                 "python_random_state"
@@ -763,6 +1187,7 @@ def restore_checkpoint(
         )
 
     if "numpy_random_state" in checkpoint:
+
         np.random.set_state(
             checkpoint[
                 "numpy_random_state"
@@ -770,6 +1195,7 @@ def restore_checkpoint(
         )
 
     if "torch_random_state" in checkpoint:
+
         torch.set_rng_state(
             checkpoint[
                 "torch_random_state"
@@ -794,7 +1220,9 @@ def restore_checkpoint(
     )
 
     best_val_dice = float(
-        checkpoint["best_val_dice"]
+        checkpoint[
+            "best_val_dice"
+        ]
     )
 
     epochs_without_improvement = int(
@@ -805,27 +1233,27 @@ def restore_checkpoint(
     )
 
     print(
-        "Checkpoint epoch      :",
+        "Checkpoint epoch     :",
         previous_epoch,
     )
 
     print(
-        "Starting epoch        :",
+        "Starting epoch       :",
         previous_epoch + 1,
     )
 
     print(
-        "Best validation Dice  :",
+        "Best validation Dice :",
         f"{best_val_dice:.6f}",
     )
 
     print(
-        "Checkpoint            :",
+        "Checkpoint           :",
         path,
     )
 
     print(
-        "V2 RESUME SUCCESSFUL"
+        "V4 RESUME SUCCESSFUL"
     )
 
     return (
@@ -838,6 +1266,7 @@ def restore_checkpoint(
 # ============================================================
 # LOGGING
 # ============================================================
+
 
 LOG_COLUMNS = [
     "epoch",
@@ -852,12 +1281,15 @@ LOG_COLUMNS = [
 ]
 
 
-def prepare_log_file(resuming):
+def prepare_log_file(
+    resuming,
+):
 
     if (
         resuming
         and LOG_FILE.exists()
     ):
+
         return
 
     with LOG_FILE.open(
@@ -912,26 +1344,49 @@ def append_log(
 # MAIN
 # ============================================================
 
+
 def main():
 
-    seed_everything(SEED)
+    seed_everything(
+        SEED
+    )
 
     print("=" * 70)
-    print("PS26143 — V2 SEGMENTATION TRAINING")
+    print("PS26143 — V4 SEGMENTATION TRAINING")
     print("=" * 70)
 
     print()
-    print("Experiment :", EXPERIMENT_NAME)
-    print("PyTorch    :", torch.__version__)
-    print("CUDA       :", torch.cuda.is_available())
+    print(
+        "Experiment :",
+        EXPERIMENT_NAME,
+    )
+
+    print(
+        "Config     :",
+        CONFIG_FILE,
+    )
+
+    print(
+        "PyTorch    :",
+        torch.__version__,
+    )
+
+    print(
+        "CUDA       :",
+        torch.cuda.is_available(),
+    )
 
     if not torch.cuda.is_available():
 
         raise RuntimeError(
-            "CUDA GPU is required for the real V2 run."
+            "\n"
+            "V4 TRAINING ABORTED\n"
+            "CUDA GPU is required."
         )
 
-    device = torch.device("cuda")
+    device = torch.device(
+        "cuda"
+    )
 
     print(
         "GPU        :",
@@ -941,19 +1396,140 @@ def main():
     print(
         "VRAM       :",
         round(
-            torch.cuda.get_device_properties(0)
-            .total_memory
+            torch.cuda.get_device_properties(
+                0
+            ).total_memory
             / (1024 ** 3),
             2,
         ),
         "GiB",
     )
 
+    # --------------------------------------------------------
+    # CONFIG SUMMARY
+    # --------------------------------------------------------
+
     print()
+    print("=" * 70)
+    print("V4 CONFIGURATION")
+    print("=" * 70)
+
     print(
-        "Processed root:",
-        PROCESSED_ROOT,
+        "Architecture     :",
+        CONFIG["model"]["architecture"],
     )
+
+    print(
+        "Encoder          :",
+        CONFIG["model"]["encoder"],
+    )
+
+    print(
+        "Input channels   :",
+        CONFIG["model"]["in_channels"],
+    )
+
+    print(
+        "Image size       :",
+        IMAGE_SIZE,
+    )
+
+    print(
+        "Batch size       :",
+        BATCH_SIZE,
+    )
+
+    print(
+        "Epochs           :",
+        EPOCHS,
+    )
+
+    print(
+        "Learning rate    :",
+        LEARNING_RATE,
+    )
+
+    print(
+        "Weight decay     :",
+        WEIGHT_DECAY,
+    )
+
+    print(
+        "AMP              :",
+        MIXED_PRECISION,
+    )
+
+    # --------------------------------------------------------
+    # LOSS SUMMARY
+    # --------------------------------------------------------
+
+    print()
+    print("=" * 70)
+    print("V4 LOSS")
+    print("=" * 70)
+
+    print(
+        "Loss type        : V4"
+    )
+
+    print(
+        "Tversky weight   :",
+        TVERSKY_WEIGHT,
+    )
+
+    print(
+        "Dice weight      :",
+        DICE_WEIGHT,
+    )
+
+    print(
+        "Focal weight     :",
+        FOCAL_WEIGHT,
+    )
+
+    print(
+        "Boundary weight  :",
+        BOUNDARY_WEIGHT,
+    )
+
+    print(
+        "Negative weight  :",
+        NEGATIVE_WEIGHT,
+    )
+
+    print(
+        "Tversky alpha    :",
+        TVERSKY_ALPHA,
+    )
+
+    print(
+        "Tversky beta     :",
+        TVERSKY_BETA,
+    )
+
+    print(
+        "Focal alpha      :",
+        FOCAL_ALPHA,
+    )
+
+    print(
+        "Focal gamma      :",
+        FOCAL_GAMMA,
+    )
+
+    print(
+        "Negative thresh  :",
+        NEGATIVE_THRESHOLD,
+    )
+
+    # --------------------------------------------------------
+    # DATA SAFETY
+    # --------------------------------------------------------
+
+    print()
+    print("=" * 70)
+    print("DATA")
+    print("=" * 70)
 
     print(
         "Train manifest:",
@@ -964,10 +1540,6 @@ def main():
         "Val manifest  :",
         VAL_MANIFEST,
     )
-
-    # --------------------------------------------------------
-    # LOAD DATA
-    # --------------------------------------------------------
 
     train_records = load_records(
         TRAIN_MANIFEST
@@ -989,7 +1561,6 @@ def main():
         135,
     )
 
-    print()
     print(
         "Training samples  :",
         len(train_records),
@@ -998,6 +1569,10 @@ def main():
     print(
         "Validation samples:",
         len(val_records),
+    )
+
+    print(
+        "Test set          : NOT USED"
     )
 
     # --------------------------------------------------------
@@ -1044,7 +1619,7 @@ def main():
 
     print()
     print("=" * 70)
-    print("BUILDING V2 MODEL")
+    print("BUILDING V4 MODEL")
     print("=" * 70)
 
     model = build_model(
@@ -1060,7 +1635,9 @@ def main():
             CONFIG["model"]["classes"],
     )
 
-    model = model.to(device)
+    model = model.to(
+        device
+    )
 
     parameter_count = sum(
         p.numel()
@@ -1095,58 +1672,39 @@ def main():
     )
 
     # --------------------------------------------------------
-    # V2 LOSS
+    # V4 LOSS
     # --------------------------------------------------------
 
-    print()
-    print("=" * 70)
-    print("V2 LOSS")
-    print("=" * 70)
+    criterion = V4SegmentationLoss(
+        tversky_weight=
+            TVERSKY_WEIGHT,
 
-    criterion = V2SegmentationLoss(
-        focal_weight=FOCAL_WEIGHT,
-        dice_weight=DICE_WEIGHT,
-        boundary_weight=BOUNDARY_WEIGHT,
-        negative_weight=NEGATIVE_WEIGHT,
-        focal_alpha=FOCAL_ALPHA,
-        focal_gamma=FOCAL_GAMMA,
+        dice_weight=
+            DICE_WEIGHT,
+
+        focal_weight=
+            FOCAL_WEIGHT,
+
+        boundary_weight=
+            BOUNDARY_WEIGHT,
+
+        negative_weight=
+            NEGATIVE_WEIGHT,
+
+        tversky_alpha=
+            TVERSKY_ALPHA,
+
+        tversky_beta=
+            TVERSKY_BETA,
+
+        focal_alpha=
+            FOCAL_ALPHA,
+
+        focal_gamma=
+            FOCAL_GAMMA,
+
         negative_threshold=
             NEGATIVE_THRESHOLD,
-    )
-
-    print(
-        "Focal weight    :",
-        FOCAL_WEIGHT,
-    )
-
-    print(
-        "Dice weight     :",
-        DICE_WEIGHT,
-    )
-
-    print(
-        "Boundary weight :",
-        BOUNDARY_WEIGHT,
-    )
-
-    print(
-        "Negative weight :",
-        NEGATIVE_WEIGHT,
-    )
-
-    print(
-        "Focal alpha     :",
-        FOCAL_ALPHA,
-    )
-
-    print(
-        "Focal gamma     :",
-        FOCAL_GAMMA,
-    )
-
-    print(
-        "Negative thresh :",
-        NEGATIVE_THRESHOLD,
     )
 
     # --------------------------------------------------------
@@ -1163,12 +1721,14 @@ def main():
     # SCHEDULER
     # --------------------------------------------------------
 
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode=CONFIG["scheduler"]["mode"],
-        patience=LR_PATIENCE,
-        factor=LR_FACTOR,
-        min_lr=MIN_LR,
+    scheduler = (
+        torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode=SCHEDULER_CONFIG["mode"],
+            patience=LR_PATIENCE,
+            factor=LR_FACTOR,
+            min_lr=MIN_LR,
+        )
     )
 
     # --------------------------------------------------------
@@ -1190,7 +1750,9 @@ def main():
 
     epochs_without_improvement = 0
 
-    resuming = LAST_CHECKPOINT.exists()
+    resuming = (
+        LAST_CHECKPOINT.exists()
+    )
 
     if resuming:
 
@@ -1217,7 +1779,7 @@ def main():
 
     print()
     print("=" * 70)
-    print("V2 TRAINING")
+    print("V4 TRAINING")
     print("=" * 70)
 
     print(
@@ -1246,11 +1808,11 @@ def main():
     )
 
     print(
-        "Checkpoint interval : every epoch",
+        "Checkpoint interval : every epoch"
     )
 
     print(
-        "Resume enabled      : True",
+        "Resume enabled      : True"
     )
 
     print(
@@ -1276,7 +1838,7 @@ def main():
 
         print()
         print(
-            "V2 training is already complete."
+            "V4 training is already complete."
         )
 
         print(
@@ -1334,7 +1896,9 @@ def main():
         )
 
         current_lr = (
-            optimizer.param_groups[0]["lr"]
+            optimizer.param_groups[0][
+                "lr"
+            ]
         )
 
         elapsed = (
@@ -1348,35 +1912,43 @@ def main():
         )
 
         print(
-            f"  Train loss : {train_loss:.6f}"
+            f"  Train loss : "
+            f"{train_loss:.6f}"
         )
 
         print(
-            f"  Train Dice : {train_dice:.6f}"
+            f"  Train Dice : "
+            f"{train_dice:.6f}"
         )
 
         print(
-            f"  Train IoU  : {train_iou:.6f}"
+            f"  Train IoU  : "
+            f"{train_iou:.6f}"
         )
 
         print(
-            f"  Val loss   : {val_loss:.6f}"
+            f"  Val loss   : "
+            f"{val_loss:.6f}"
         )
 
         print(
-            f"  Val Dice   : {val_dice:.6f}"
+            f"  Val Dice   : "
+            f"{val_dice:.6f}"
         )
 
         print(
-            f"  Val IoU    : {val_iou:.6f}"
+            f"  Val IoU    : "
+            f"{val_iou:.6f}"
         )
 
         print(
-            f"  LR         : {current_lr:.8f}"
+            f"  LR         : "
+            f"{current_lr:.8f}"
         )
 
         print(
-            f"  Time       : {elapsed:.1f}s"
+            f"  Time       : "
+            f"{elapsed:.1f}s"
         )
 
         # ----------------------------------------------------
@@ -1418,7 +1990,7 @@ def main():
 
             print()
             print(
-                "★ NEW V2 BEST CHECKPOINT"
+                "★ NEW V4 BEST CHECKPOINT"
             )
 
             print(
@@ -1447,7 +2019,7 @@ def main():
 
         print()
         print(
-            "✓ V2 LAST CHECKPOINT SAVED"
+            "✓ V4 LAST CHECKPOINT SAVED"
         )
 
         # ----------------------------------------------------
@@ -1461,12 +2033,14 @@ def main():
 
             print()
             print(
-                "V2 EARLY STOPPING"
+                "V4 EARLY STOPPING"
             )
 
             print(
                 "No validation Dice improvement "
-                f"for {EARLY_STOPPING_PATIENCE} epochs."
+                f"for "
+                f"{EARLY_STOPPING_PATIENCE} "
+                "epochs."
             )
 
             break
@@ -1477,7 +2051,7 @@ def main():
 
     print()
     print("=" * 70)
-    print("V2 TRAINING COMPLETE")
+    print("V4 TRAINING COMPLETE")
     print("=" * 70)
 
     print(
@@ -1502,5 +2076,11 @@ def main():
     )
 
 
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+
 if __name__ == "__main__":
+
     main()

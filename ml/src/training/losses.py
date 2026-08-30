@@ -1,37 +1,24 @@
-from __future__ import annotations
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ============================================================
-# DICE LOSS
-# ============================================================
-
 class DiceLoss(nn.Module):
     """
-    Soft Dice loss for binary segmentation.
+    Standard soft Dice loss.
 
-    Designed to work safely with AMP / float16 inputs.
+    Used for foreground overlap.
     """
 
-    def __init__(self, smooth: float = 1.0):
+    def __init__(self, smooth=1.0):
         super().__init__()
-        self.smooth = float(smooth)
+        self.smooth = smooth
 
-    def forward(
-        self,
-        logits: torch.Tensor,
-        targets: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward(self, logits, targets):
+        probs = torch.sigmoid(logits)
 
-        # Perform probability calculation in float32.
-        probs = torch.sigmoid(logits.float())
-        targets = targets.float()
-
-        probs = probs.contiguous().flatten(1)
-        targets = targets.contiguous().flatten(1)
+        probs = probs.contiguous().view(probs.size(0), -1)
+        targets = targets.contiguous().view(targets.size(0), -1)
 
         intersection = (probs * targets).sum(dim=1)
 
@@ -46,41 +33,81 @@ class DiceLoss(nn.Module):
         return 1.0 - dice.mean()
 
 
-# ============================================================
-# FOCAL BCE LOSS
-# ============================================================
-
-class FocalBCELoss(nn.Module):
+class TverskyLoss(nn.Module):
     """
-    Binary focal loss.
+    Recall-oriented Tversky loss.
 
-    Focusing parameter gamma emphasizes difficult pixels.
-    Alpha controls positive/negative class weighting.
+    alpha controls FP penalty.
+    beta controls FN penalty.
 
-    Calculated in float32 for numerical stability under AMP.
+    beta > alpha means FN are penalized more strongly,
+    which directly targets V1's low oil recall.
     """
 
     def __init__(
         self,
-        alpha: float = 0.75,
-        gamma: float = 2.0,
+        alpha=0.30,
+        beta=0.70,
+        smooth=1.0,
     ):
         super().__init__()
 
-        self.alpha = float(alpha)
-        self.gamma = float(gamma)
+        self.alpha = alpha
+        self.beta = beta
+        self.smooth = smooth
 
-    def forward(
+    def forward(self, logits, targets):
+        probs = torch.sigmoid(logits)
+
+        probs = probs.contiguous().view(
+            probs.size(0), -1
+        )
+        targets = targets.contiguous().view(
+            targets.size(0), -1
+        )
+
+        tp = (probs * targets).sum(dim=1)
+
+        fp = (
+            probs * (1.0 - targets)
+        ).sum(dim=1)
+
+        fn = (
+            (1.0 - probs) * targets
+        ).sum(dim=1)
+
+        tversky = (
+            tp + self.smooth
+        ) / (
+            tp
+            + self.alpha * fp
+            + self.beta * fn
+            + self.smooth
+        )
+
+        return 1.0 - tversky.mean()
+
+
+class FocalBCELoss(nn.Module):
+    """
+    Focal BCE.
+
+    Keeps difficult-pixel learning from V2, but with
+    balanced alpha so we do not repeat V2's aggressive
+    false-positive behaviour.
+    """
+
+    def __init__(
         self,
-        logits: torch.Tensor,
-        targets: torch.Tensor,
-    ) -> torch.Tensor:
+        alpha=0.60,
+        gamma=2.0,
+    ):
+        super().__init__()
 
-        # Float32 avoids unnecessary AMP precision loss
-        # inside the loss calculation.
-        logits = logits.float()
-        targets = targets.float()
+        self.alpha = alpha
+        self.gamma = gamma
 
+    def forward(self, logits, targets):
         probs = torch.sigmoid(logits)
 
         bce = F.binary_cross_entropy_with_logits(
@@ -109,22 +136,14 @@ class FocalBCELoss(nn.Module):
         ).mean()
 
 
-# ============================================================
-# BOUNDARY LOSS
-# ============================================================
-
 class BoundaryLoss(nn.Module):
     """
-    Boundary-aware loss.
+    Boundary structure loss.
 
-    Compares Sobel-style local gradients between the
-    predicted probability map and the target mask.
-
-    IMPORTANT:
-    The Sobel kernels are explicitly converted to the
-    input tensor's dtype/device before convolution.
-
-    This makes the loss AMP-safe.
+    Important:
+    kernels are converted to the SAME dtype/device as
+    the input. This avoids the AMP Half-vs-Float failure
+    encountered during V2 training.
     """
 
     def __init__(self):
@@ -158,17 +177,8 @@ class BoundaryLoss(nn.Module):
             kernel_y,
         )
 
-    def _edges(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
+    def _edges(self, x):
 
-        # ----------------------------------------------------
-        # CRITICAL AMP FIX
-        # ----------------------------------------------------
-        #
-        # Match the kernels to the input exactly.
-        #
         kernel_x = self.kernel_x.to(
             device=x.device,
             dtype=x.dtype,
@@ -191,36 +201,20 @@ class BoundaryLoss(nn.Module):
             padding=1,
         )
 
-        # Small epsilon prevents sqrt(0) instability.
         return torch.sqrt(
             gx.pow(2)
             + gy.pow(2)
             + 1e-6
         )
 
-    def forward(
-        self,
-        logits: torch.Tensor,
-        targets: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward(self, logits, targets):
 
-        # Boundary calculation in float32.
-        #
-        # This is deliberately outside AMP precision because
-        # this loss is specifically measuring small local
-        # geometric differences.
-        probs = torch.sigmoid(
-            logits.float()
-        )
+        probs = torch.sigmoid(logits)
 
-        targets = targets.float()
-
-        pred_edges = self._edges(
-            probs
-        )
+        pred_edges = self._edges(probs)
 
         true_edges = self._edges(
-            targets
+            targets.to(dtype=probs.dtype)
         )
 
         return F.l1_loss(
@@ -229,40 +223,31 @@ class BoundaryLoss(nn.Module):
         )
 
 
-# ============================================================
-# NEGATIVE SCENE LOSS
-# ============================================================
-
 class NegativeSceneLoss(nn.Module):
     """
-    Explicitly suppresses predictions on completely negative
-    scenes such as lookalike and no-oil scenes.
+    Controlled negative-scene suppression.
 
-    Only activates for samples whose ground-truth mask
-    contains zero positive pixels.
+    Unlike V2, this is deliberately weak.
+
+    It only penalizes confident predictions in completely
+    negative scenes. The threshold is high enough that
+    ordinary low-probability background is not aggressively
+    suppressed.
+
+    This prevents the loss from recreating V2's FP behaviour.
     """
 
     def __init__(
         self,
-        threshold: float = 0.10,
+        threshold=0.30,
     ):
         super().__init__()
 
-        self.threshold = float(
-            threshold
-        )
+        self.threshold = threshold
 
-    def forward(
-        self,
-        logits: torch.Tensor,
-        targets: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward(self, logits, targets):
 
-        probs = torch.sigmoid(
-            logits.float()
-        )
-
-        targets = targets.float()
+        probs = torch.sigmoid(logits)
 
         target_area = (
             targets
@@ -270,22 +255,13 @@ class NegativeSceneLoss(nn.Module):
             .sum(dim=1)
         )
 
-        negative = (
-            target_area <= 0
-        )
+        negative = target_area <= 0
 
         if not negative.any():
-            return logits.new_tensor(
-                0.0,
-                dtype=torch.float32,
-            )
+            return logits.new_tensor(0.0)
 
-        negative_probs = probs[
-            negative
-        ]
+        negative_probs = probs[negative]
 
-        # Penalize probabilities above
-        # the allowed tolerance.
         excess = F.relu(
             negative_probs
             - self.threshold
@@ -294,64 +270,84 @@ class NegativeSceneLoss(nn.Module):
         return excess.pow(2).mean()
 
 
-# ============================================================
-# V2 COMBINED LOSS
-# ============================================================
-
-class V2SegmentationLoss(nn.Module):
+class V4SegmentationLoss(nn.Module):
     """
-    PS26143 V2 segmentation objective.
+    PS26143 V4 objective.
 
-    Components:
+    Design target:
 
-        Focal BCE
-            Difficult pixels and false positives.
+        V1 problem:
+            recall = 0.6867
+
+        V2 problem:
+            false-positive rejection deteriorated badly.
+
+    Therefore V4 uses:
+
+        Tversky
+            -> explicit FN pressure / recall recovery
 
         Dice
-            Region overlap.
+            -> region overlap stability
+
+        Focal BCE
+            -> difficult pixels
 
         Boundary
-            Slick geometry and edge quality.
+            -> geometry
 
-        Negative Scene
-            Explicit suppression of predictions in
-            lookalike / no-oil scenes.
+        Weak negative-scene penalty
+            -> preserve negative-scene discrimination
+
+    This is intentionally NOT the V2 objective.
     """
 
     def __init__(
         self,
-        focal_weight: float = 0.30,
-        dice_weight: float = 0.45,
-        boundary_weight: float = 0.15,
-        negative_weight: float = 0.10,
-        focal_alpha: float = 0.75,
-        focal_gamma: float = 2.0,
-        negative_threshold: float = 0.10,
+        tversky_weight=0.40,
+        dice_weight=0.25,
+        focal_weight=0.20,
+        boundary_weight=0.10,
+        negative_weight=0.05,
+        tversky_alpha=0.30,
+        tversky_beta=0.70,
+        focal_alpha=0.60,
+        focal_gamma=2.0,
+        negative_threshold=0.30,
     ):
         super().__init__()
 
-        self.focal_weight = float(
-            focal_weight
+        self.tversky_weight = (
+            tversky_weight
         )
 
-        self.dice_weight = float(
+        self.dice_weight = (
             dice_weight
         )
 
-        self.boundary_weight = float(
+        self.focal_weight = (
+            focal_weight
+        )
+
+        self.boundary_weight = (
             boundary_weight
         )
 
-        self.negative_weight = float(
+        self.negative_weight = (
             negative_weight
         )
+
+        self.tversky = TverskyLoss(
+            alpha=tversky_alpha,
+            beta=tversky_beta,
+        )
+
+        self.dice = DiceLoss()
 
         self.focal = FocalBCELoss(
             alpha=focal_alpha,
             gamma=focal_gamma,
         )
-
-        self.dice = DiceLoss()
 
         self.boundary = BoundaryLoss()
 
@@ -359,18 +355,19 @@ class V2SegmentationLoss(nn.Module):
             threshold=negative_threshold,
         )
 
-    def forward(
-        self,
-        logits: torch.Tensor,
-        targets: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward(self, logits, targets):
 
-        focal = self.focal(
+        tversky = self.tversky(
             logits,
             targets,
         )
 
         dice = self.dice(
+            logits,
+            targets,
+        )
+
+        focal = self.focal(
             logits,
             targets,
         )
@@ -386,8 +383,9 @@ class V2SegmentationLoss(nn.Module):
         )
 
         total = (
-            self.focal_weight * focal
+            self.tversky_weight * tversky
             + self.dice_weight * dice
+            + self.focal_weight * focal
             + self.boundary_weight * boundary
             + self.negative_weight * negative
         )
@@ -395,21 +393,19 @@ class V2SegmentationLoss(nn.Module):
         return total
 
     @torch.no_grad()
-    def components(
-        self,
-        logits: torch.Tensor,
-        targets: torch.Tensor,
-    ) -> dict[str, float]:
-        """
-        Return individual loss components for logging/debugging.
-        """
+    def components(self, logits, targets):
 
-        focal = self.focal(
+        tversky = self.tversky(
             logits,
             targets,
         )
 
         dice = self.dice(
+            logits,
+            targets,
+        )
+
+        focal = self.focal(
             logits,
             targets,
         )
@@ -425,11 +421,14 @@ class V2SegmentationLoss(nn.Module):
         )
 
         return {
-            "focal": float(
-                focal.item()
+            "tversky": float(
+                tversky.item()
             ),
             "dice": float(
                 dice.item()
+            ),
+            "focal": float(
+                focal.item()
             ),
             "boundary": float(
                 boundary.item()
@@ -438,3 +437,53 @@ class V2SegmentationLoss(nn.Module):
                 negative.item()
             ),
         }
+
+
+# ------------------------------------------------------------------
+# BACKWARD COMPATIBILITY
+# ------------------------------------------------------------------
+
+# V1 / existing evaluator compatibility.
+class BCEDiceLoss(nn.Module):
+
+    def __init__(
+        self,
+        bce_weight=0.5,
+        dice_weight=0.5,
+    ):
+        super().__init__()
+
+        self.bce_weight = bce_weight
+        self.dice_weight = dice_weight
+
+        self.bce = nn.BCEWithLogitsLoss()
+        self.dice = DiceLoss()
+
+    def forward(self, logits, targets):
+
+        bce = self.bce(
+            logits,
+            targets,
+        )
+
+        dice = self.dice(
+            logits,
+            targets,
+        )
+
+        return (
+            self.bce_weight * bce
+            + self.dice_weight * dice
+        )
+
+
+# V2 compatibility.
+class V2Loss(V4SegmentationLoss):
+    """
+    Kept only so older imports do not break.
+
+    The actual V2 experiment should remain reproducible
+    from its existing checkpoint and source history.
+    """
+
+    pass
